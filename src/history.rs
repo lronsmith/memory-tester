@@ -11,9 +11,12 @@
 //! serial  part_number  size_mb  status  when_unix  label
 //! ```
 //!
-//! `status` is `passed` or `failed`, `size_mb` and `when_unix` are decimal
-//! integers. In the text fields a backslash, tab, newline or carriage return
-//! is written as `\\`, `\t`, `\n` or `\r`.
+//! `status` is `passed` or `failed` for a remembered result, or `shared` for
+//! a key that two or more sticks installed at the same time reported (see
+//! [`History::apply`]); a `shared` line's time is when that was first seen.
+//! A file without `shared` lines is equally valid. `size_mb` and `when_unix`
+//! are decimal integers. In the text fields a backslash, tab, newline or
+//! carriage return is written as `\\`, `\t`, `\n` or `\r`.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -85,11 +88,31 @@ pub struct Record {
     pub label: String,
 }
 
+/// A key that two or more sticks installed at the same time reported, so it
+/// cannot tell those sticks apart.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct SharedKey {
+    key: StickKey,
+    /// When this was first seen, seconds since the Unix epoch.
+    when_unix: u64,
+    /// The stick's description, for a person reading the file.
+    label: String,
+}
+
+/// One parsed line of the history file.
+enum Line {
+    Result(Record),
+    Shared(SharedKey),
+}
+
 /// The remembered results, together with the file they are saved to.
 #[derive(Clone, Debug)]
 pub struct History {
-    /// At most one record per key, oldest first.
+    /// At most one record per key, oldest first; never one for a key in
+    /// `shared`.
     records: Vec<Record>,
+    /// Keys that are never used for a result (see [`History::apply`]).
+    shared: Vec<SharedKey>,
     /// The file `save` writes; `None` for a history kept in memory only.
     path: Option<PathBuf>,
 }
@@ -100,11 +123,20 @@ impl History {
     pub fn load(path: &Path) -> History {
         let mut history = History {
             records: Vec::new(),
+            shared: Vec::new(),
             path: Some(path.to_path_buf()),
         };
         if let Some(bytes) = read_small_file(path) {
-            for record in parse(&bytes) {
-                history.merge(record);
+            let (results, shared): (Vec<Line>, Vec<Line>) = parse(&bytes)
+                .into_iter()
+                .partition(|line| matches!(line, Line::Result(_)));
+            // Shared keys first, so a result stored under one is dropped
+            // wherever it appears in the file.
+            for line in shared.into_iter().chain(results) {
+                match line {
+                    Line::Shared(shared) => history.mark_shared(shared),
+                    Line::Result(record) => history.merge(record),
+                };
             }
             history.sort();
         }
@@ -117,6 +149,7 @@ impl History {
     pub fn in_memory() -> History {
         History {
             records: Vec::new(),
+            shared: Vec::new(),
             path: None,
         }
     }
@@ -126,9 +159,25 @@ impl History {
         History::load(&default_path())
     }
 
-    /// The remembered result for `key`, if any.
+    /// The remembered result for `key`, if any. Always `None` for a key that
+    /// has been seen on two sticks at once.
     pub fn get(&self, key: &StickKey) -> Option<&Record> {
         self.records.iter().find(|r| &r.key == key)
+    }
+
+    /// The key under which each slot's result can be remembered, one entry
+    /// per slot in the same order.
+    ///
+    /// An entry is `None` for an empty slot, for a stick without a usable
+    /// serial, for every stick whose key is shared with another installed
+    /// stick (a result stored under a shared key would be shown for both),
+    /// and for a stick whose key this history has seen shared before, even
+    /// if that stick is now installed on its own.
+    pub fn rememberable_keys(&self, slots: &[Slot]) -> Vec<Option<StickKey>> {
+        unique_keys(slots)
+            .into_iter()
+            .map(|key| key.filter(|k| !self.is_shared(k)))
+            .collect()
     }
 
     /// All remembered results, oldest first.
@@ -137,15 +186,33 @@ impl History {
     }
 
     /// Records the outcome of a run for every installed stick that has a key
-    /// (see [`rememberable_keys`]). Returns true if anything changed.
+    /// (see [`History::rememberable_keys`]). Returns true if anything changed.
     ///
     /// Only `Passed` and `Failed` are remembered. A stored `Failed` is never
     /// replaced by a later `Passed`, because a faulty stick can pass a short
     /// test; only [`History::clear`] removes it. A result of the same status
     /// never moves the stored time backwards.
+    ///
+    /// A key reported by two or more of the installed sticks is marked as
+    /// shared, whatever the verdict: any result stored under it is dropped,
+    /// and from then on no result is stored or returned for it, even when
+    /// one of those sticks is later tested on its own. Otherwise one twin's
+    /// result would be shown for the other.
     pub fn apply(&mut self, slots: &[Slot], verdict: &Verdict, now_unix: u64) -> bool {
-        let keys = rememberable_keys(slots);
         let mut changed = false;
+        for (slot, unique) in slots.iter().zip(unique_keys(slots)) {
+            let Some(stick) = &slot.stick else {
+                continue;
+            };
+            if let (Some(key), None) = (StickKey::from_stick(stick), unique) {
+                changed |= self.mark_shared(SharedKey {
+                    key,
+                    when_unix: now_unix,
+                    label: label_for(stick),
+                });
+            }
+        }
+        let keys = self.rememberable_keys(slots);
         for ((slot, key), &status) in slots.iter().zip(keys).zip(&verdict.per_slot) {
             if !matches!(status, StickStatus::Passed | StickStatus::Failed) {
                 continue;
@@ -200,14 +267,37 @@ impl History {
         result
     }
 
-    /// Forgets everything (in memory; call `save` to persist).
+    /// Forgets every remembered result (in memory; call `save` to persist).
+    ///
+    /// Keys seen shared by two sticks stay marked: that is a fact about the
+    /// sticks, not a result, and forgetting it would let one twin's result
+    /// be shown for the other again.
     pub fn clear(&mut self) {
         self.records.clear();
     }
 
+    fn is_shared(&self, key: &StickKey) -> bool {
+        self.shared.iter().any(|s| &s.key == key)
+    }
+
+    /// Marks a key as shared and drops any result stored under it. Returns
+    /// true if it was not marked before.
+    fn mark_shared(&mut self, shared: SharedKey) -> bool {
+        if self.is_shared(&shared.key) {
+            return false;
+        }
+        self.records.retain(|r| r.key != shared.key);
+        self.shared.push(shared);
+        true
+    }
+
     /// Folds one result into the records following the sticky-failed rule.
-    /// Returns true if anything changed.
+    /// Returns true if anything changed. A result for a shared key is
+    /// ignored.
     fn merge(&mut self, mut new: Record) -> bool {
+        if self.is_shared(&new.key) {
+            return false;
+        }
         let Some(old) = self.records.iter_mut().find(|r| r.key == new.key) else {
             self.records.push(new);
             return true;
@@ -248,6 +338,16 @@ impl History {
                 escape(&r.label),
             ));
         }
+        for s in &self.shared {
+            text.push_str(&format!(
+                "{}\t{}\t{}\tshared\t{}\t{}\n",
+                escape(&s.key.serial),
+                escape(&s.key.part_number),
+                s.key.size_mb,
+                s.when_unix,
+                escape(&s.label),
+            ));
+        }
         text
     }
 }
@@ -281,7 +381,7 @@ fn read_small_file(path: &Path) -> Option<Vec<u8>> {
 
 /// Parses the file contents. An unknown header gives nothing; bad lines,
 /// including lines that are not valid UTF-8, are skipped one by one.
-fn parse(bytes: &[u8]) -> Vec<Record> {
+fn parse(bytes: &[u8]) -> Vec<Line> {
     let bytes = bytes.strip_prefix("\u{FEFF}".as_bytes()).unwrap_or(bytes);
     let mut lines = bytes
         .split(|&b| b == b'\n')
@@ -295,7 +395,7 @@ fn parse(bytes: &[u8]) -> Vec<Record> {
         .collect()
 }
 
-fn parse_line(line: &str) -> Option<Record> {
+fn parse_line(line: &str) -> Option<Line> {
     let fields: Vec<&str> = line.split('\t').collect();
     let [serial, part_number, size_mb, status, when_unix, label] = fields[..] else {
         return None;
@@ -304,20 +404,32 @@ fn parse_line(line: &str) -> Option<Record> {
     if serial.trim().is_empty() {
         return None;
     }
+    // `None` for a shared key.
     let status = match status {
-        "passed" => StickStatus::Passed,
-        "failed" => StickStatus::Failed,
+        "passed" => Some(StickStatus::Passed),
+        "failed" => Some(StickStatus::Failed),
+        "shared" => None,
         _ => return None,
     };
-    Some(Record {
-        key: StickKey {
-            serial,
-            part_number: unescape(part_number)?,
-            size_mb: size_mb.parse().ok()?,
-        },
-        status,
-        when_unix: when_unix.parse().ok()?,
-        label: unescape(label)?,
+    let key = StickKey {
+        serial,
+        part_number: unescape(part_number)?,
+        size_mb: size_mb.parse().ok()?,
+    };
+    let when_unix = when_unix.parse().ok()?;
+    let label = unescape(label)?;
+    Some(match status {
+        Some(status) => Line::Result(Record {
+            key,
+            status,
+            when_unix,
+            label,
+        }),
+        None => Line::Shared(SharedKey {
+            key,
+            when_unix,
+            label,
+        }),
     })
 }
 
@@ -355,13 +467,10 @@ fn unescape(field: &str) -> Option<String> {
     Some(out)
 }
 
-/// The key under which each slot's result can be remembered, one entry per
-/// slot in the same order.
-///
-/// An entry is `None` for an empty slot, for a stick without a usable serial,
-/// and for every stick whose key is shared with another installed stick: a
-/// result stored under a shared key would be shown for both sticks.
-pub fn rememberable_keys(slots: &[Slot]) -> Vec<Option<StickKey>> {
+/// Each slot's key, one entry per slot in the same order: `None` for an empty
+/// slot, for a stick without a usable serial, and for every stick whose key
+/// is shared with another installed stick.
+fn unique_keys(slots: &[Slot]) -> Vec<Option<StickKey>> {
     let keys: Vec<Option<StickKey>> = slots
         .iter()
         .map(|s| s.stick.as_ref().and_then(StickKey::from_stick))
@@ -878,13 +987,117 @@ mod tests {
         assert!(h.get(&key("12345678")).is_none());
         assert!(h.get(&key("UNIQUE")).is_some());
 
-        let keys = rememberable_keys(&slots);
+        let keys = h.rememberable_keys(&slots);
         assert_eq!(keys, vec![None, None, Some(key("UNIQUE"))]);
         // An empty slot never has a key, and a lone stick keeps its key.
         assert_eq!(
-            rememberable_keys(&[slot(None), slot(Some(stick(Some("A"))))]),
+            h.rememberable_keys(&[slot(None), slot(Some(stick(Some("A"))))]),
             vec![None, Some(key("A"))]
         );
+    }
+
+    /// Two sticks reporting the same serial, plus one with its own.
+    fn twins_and_one() -> Vec<Slot> {
+        vec![
+            slot(Some(stick(Some("SAME")))),
+            slot(Some(stick(Some("SAME")))),
+            slot(Some(stick(Some("UNIQUE")))),
+        ]
+    }
+
+    #[test]
+    fn a_key_seen_on_two_sticks_at_once_is_never_remembered_even_for_one_alone() {
+        let dir = TempDir::new();
+        let mut h = empty_at(&dir.file());
+        // First run with every stick in: errors, so all are suspects. Even a
+        // verdict that stores nothing marks the shared key.
+        let suspects = verdict(vec![Suspect, Suspect, Suspect]);
+        assert!(h.apply(&twins_and_one(), &suspects, 10));
+        assert!(!h.apply(&twins_and_one(), &suspects, 11), "marked once");
+        assert!(h.records().is_empty());
+
+        // Then each twin alone: the faulty one fails, the good one passes.
+        // Neither result is stored or offered for display.
+        let alone = vec![slot(Some(stick(Some("SAME"))))];
+        assert_eq!(h.rememberable_keys(&alone), vec![None]);
+        assert!(!h.apply(&alone, &verdict(vec![Failed]), 20));
+        assert!(!h.apply(&alone, &verdict(vec![Passed]), 30));
+        assert!(h.get(&key("SAME")).is_none());
+        assert!(h.records().is_empty());
+
+        // The same after a save and a reload.
+        h.save().unwrap();
+        let mut loaded = History::load(&dir.file());
+        assert_eq!(loaded.rememberable_keys(&alone), vec![None]);
+        assert!(!loaded.apply(&alone, &verdict(vec![Failed]), 40));
+        assert!(loaded.get(&key("SAME")).is_none());
+        // The stick with its own serial is unaffected.
+        let unique = vec![slot(Some(stick(Some("UNIQUE"))))];
+        assert!(loaded.apply(&unique, &verdict(vec![Passed]), 50));
+        assert_eq!(loaded.get(&key("UNIQUE")).unwrap().status, Passed);
+    }
+
+    #[test]
+    fn seeing_a_key_shared_drops_the_result_stored_under_it() {
+        let dir = TempDir::new();
+        let mut h = empty_at(&dir.file());
+        // One twin was tested alone first and failed...
+        let alone = vec![slot(Some(stick(Some("SAME"))))];
+        assert!(h.apply(&alone, &verdict(vec![Failed]), 10));
+        assert!(h.get(&key("SAME")).is_some());
+        // ...then both are seen together: that failure may belong to either.
+        assert!(h.apply(&twins_and_one(), &verdict(vec![Passed; 3]), 20));
+        assert!(h.get(&key("SAME")).is_none());
+        let serials: Vec<&str> = h.records().iter().map(|r| r.key.serial()).collect();
+        assert_eq!(serials, vec!["UNIQUE"]);
+    }
+
+    #[test]
+    fn shared_keys_are_saved_as_lines_of_their_own_and_survive_forgetting() {
+        let dir = TempDir::new();
+        let mut h = empty_at(&dir.file());
+        h.apply(&twins_and_one(), &verdict(vec![Passed; 3]), 42);
+        h.save().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.file()).unwrap(),
+            "memory-tester history v1\n\
+             UNIQUE\tCMK32GX4M2E3200C16\t16384\tpassed\t42\tCorsair CMK32GX4M2E3200C16, 16 GB\n\
+             SAME\tCMK32GX4M2E3200C16\t16384\tshared\t42\tCorsair CMK32GX4M2E3200C16, 16 GB\n"
+        );
+        // Forgetting results keeps the fact that the key is shared.
+        h.clear();
+        h.save().unwrap();
+        let mut loaded = History::load(&dir.file());
+        assert!(loaded.records().is_empty());
+        let alone = vec![slot(Some(stick(Some("SAME"))))];
+        assert!(!loaded.apply(&alone, &verdict(vec![Failed]), 50));
+        assert!(loaded.records().is_empty());
+    }
+
+    #[test]
+    fn load_drops_results_for_shared_keys_wherever_they_appear() {
+        let dir = TempDir::new();
+        let text = "memory-tester history v1\n\
+                    S1\tP\t8192\tfailed\t100\tL\n\
+                    S1\tP\t8192\tshared\t50\tL\n\
+                    S2\tP\t8192\tshared\t60\tL\n\
+                    S2\tP\t8192\tpassed\t200\tL\n\
+                    S3\tP\t8192\tpassed\t300\tL\n\
+                    S4\tP\t8192\tshared\tsoon\tbad time\n";
+        std::fs::write(dir.file(), text).unwrap();
+        let h = History::load(&dir.file());
+        let serials: Vec<&str> = h.records().iter().map(|r| r.key.serial()).collect();
+        assert_eq!(serials, vec!["S3"]);
+        let one = |serial: &str| {
+            let mut s = stick(Some(serial));
+            s.part_number = "P".to_string();
+            s.size_mb = 8192;
+            vec![slot(Some(s))]
+        };
+        assert_eq!(h.rememberable_keys(&one("S1")), vec![None]);
+        assert_eq!(h.rememberable_keys(&one("S2")), vec![None]);
+        // A malformed shared line is skipped like any other bad line.
+        assert!(h.rememberable_keys(&one("S4"))[0].is_some());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use memory_tester::engine::{self, Progress, TestConfig, TestHandle};
-use memory_tester::history::{History, Record, StickKey, rememberable_keys};
+use memory_tester::history::{History, Record, StickKey};
 use memory_tester::types::{Slot, StickStatus, TestSummary};
 use memory_tester::verdict::{self, Overall, Verdict};
 
@@ -25,8 +25,10 @@ pub enum Length {
 }
 
 impl Length {
-    /// Every choice, in the order offered; the first is the default.
-    pub const ALL: [Length; 3] = [Length::Quick, Length::Thorough, Length::UntilStopped];
+    /// Every choice, in the order offered; the first is the default. A single
+    /// pass is a weak test for a PC suspected of a fault, so the thorough
+    /// test comes first.
+    pub const ALL: [Length; 3] = [Length::Thorough, Length::Quick, Length::UntilStopped];
 
     /// The words shown for this choice.
     pub fn label(self) -> &'static str {
@@ -109,7 +111,8 @@ pub enum RunState {
 pub struct SlotShown {
     /// Decides the colour and status word.
     pub shown: Shown,
-    /// A small caption about an earlier result, e.g. "Remembered from 2026-11-23".
+    /// A small caption about an earlier result, e.g. "Remembered by serial
+    /// number from 2026-11-23".
     pub note: Option<String>,
 }
 
@@ -290,7 +293,7 @@ impl Model {
 
     /// Turns a finished run into a [`Finished`] state, updating history.
     fn finish(&mut self, summary: TestSummary, now_unix: u64) {
-        let verdict = verdict::judge(&self.slots, &summary);
+        let verdict = verdict::judge(&self.slots, &summary, &self.history);
         let changed = self.history.apply(&self.slots, &verdict, now_unix);
         let save_error = if changed && self.persist {
             self.history
@@ -364,6 +367,30 @@ impl Model {
     pub fn past_results(&self) -> Vec<PastResult> {
         past_results(&self.slots, self.history.records())
     }
+
+    /// After a pass, or a failure pinned on the one installed stick: a note
+    /// saying the result will not be remembered, when this app cannot
+    /// recognise an installed stick later (no usable serial number, or one
+    /// shared with another stick). The advice for several suspects already
+    /// says this itself.
+    pub fn unremembered_note(&self) -> Option<&'static str> {
+        let finished = self.finished()?;
+        if !matches!(
+            finished.verdict.overall,
+            Overall::Pass | Overall::FailSingle
+        ) {
+            return None;
+        }
+        let keys = self.history.rememberable_keys(&self.slots);
+        let installed = self.slots.iter().filter(|s| s.stick.is_some()).count();
+        let unrecognised = self
+            .slots
+            .iter()
+            .zip(keys)
+            .filter(|(slot, key)| slot.stick.is_some() && key.is_none())
+            .count();
+        text::unremembered_note(unrecognised, installed)
+    }
 }
 
 /// Seconds since the Unix epoch, 0 if the clock is before it.
@@ -377,7 +404,7 @@ fn unix_now() -> u64 {
 ///
 /// - An empty slot shows `Empty`.
 /// - While a run is going, every installed stick shows `Testing`, keeping its
-///   "Remembered from" note so the layout does not jump.
+///   "Remembered by serial number" note so the layout does not jump.
 /// - A remembered `Failed` beats a `Passed` from this session: the stick stays
 ///   `Failed`, with a note that it passed this time. The history keeps a
 ///   failure until the person clears it, so this is also what the window
@@ -386,7 +413,7 @@ fn unix_now() -> u64 {
 ///   slot) beats a remembered one. A session `Suspect` for a stick remembered
 ///   as failed notes that earlier failure.
 /// - Otherwise the remembered result is shown with its date, if the stick
-///   can be recognised (see [`rememberable_keys`]).
+///   can be recognised (see [`History::rememberable_keys`]).
 /// - Otherwise the stick is `Untested`.
 pub fn resolve_slots(
     slots: &[Slot],
@@ -394,7 +421,7 @@ pub fn resolve_slots(
     history: &History,
     running: bool,
 ) -> Vec<SlotShown> {
-    let keys = rememberable_keys(slots);
+    let keys = history.rememberable_keys(slots);
     slots
         .iter()
         .zip(keys)
@@ -534,17 +561,19 @@ mod tests {
     }
 
     #[test]
-    fn length_choices_in_order_with_quick_first() {
+    fn length_choices_in_order_with_thorough_first_and_default() {
         let labels: Vec<&str> = Length::ALL.iter().map(|l| l.label()).collect();
         assert_eq!(
             labels,
-            ["Quick (1 pass)", "Thorough (4 passes)", "Until I stop it"]
+            ["Thorough (4 passes)", "Quick (1 pass)", "Until I stop it"]
         );
         assert_eq!(Length::Quick.passes(), Some(1));
         assert_eq!(Length::Thorough.passes(), Some(4));
         assert_eq!(Length::UntilStopped.passes(), None);
         let model = Model::new(Vec::new(), empty_history());
-        assert_eq!(model.length, Length::Quick);
+        assert_eq!(model.length, Length::Thorough);
+        assert_eq!(model.test_config().passes, Some(4));
+        assert_eq!(Model::demo(Demo::Pass).length, Length::Thorough);
     }
 
     #[test]
@@ -605,7 +634,10 @@ mod tests {
         for session in [None, Some(&[Untested][..])] {
             let views = resolve_slots(&slots, session, &history, false);
             assert_eq!(views[0].shown, shown(Passed));
-            assert_eq!(views[0].note.as_deref(), Some("Remembered from 2026-11-23"));
+            assert_eq!(
+                views[0].note.as_deref(),
+                Some("Remembered by serial number from 2026-11-23")
+            );
         }
     }
 
@@ -633,8 +665,8 @@ mod tests {
             SlotShown {
                 shown: shown(Failed),
                 note: Some(
-                    "Passed this time, but failed on 2026-11-22. \
-                     A faulty stick can pass a short test."
+                    "Passed this time, but a stick with this serial number failed on \
+                     2026-11-22. A faulty stick can pass a short test."
                         .to_string()
                 ),
             }
@@ -672,7 +704,7 @@ mod tests {
         assert_eq!(views[0].shown, shown(Suspect));
         assert_eq!(
             views[0].note.as_deref(),
-            Some("Failed when tested alone on 2026-11-22.")
+            Some("A stick with this serial number failed when tested alone on 2026-11-22.")
         );
     }
 
@@ -700,7 +732,10 @@ mod tests {
         let history = remembering(&slots, Failed, DAY0);
         let views = resolve_slots(&slots, Some(&[Passed, Untested, Passed]), &history, true);
         assert_eq!(views[0].shown, Shown::Testing);
-        assert_eq!(views[0].note.as_deref(), Some("Remembered from 2026-11-22"));
+        assert_eq!(
+            views[0].note.as_deref(),
+            Some("Remembered by serial number from 2026-11-22")
+        );
         assert_eq!(views[1].shown, Shown::Empty);
         assert_eq!(
             views[2],
@@ -901,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn stopping_ends_the_run_inconclusively() {
+    fn stopping_ends_the_run() {
         let _one_at_a_time = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
         let mut model = Model::demo(Demo::Pass);
         model.length = Length::UntilStopped;
@@ -915,8 +950,177 @@ mod tests {
         run_to_end(&mut model);
         let finished = model.finished().unwrap();
         assert_eq!(finished.summary.end, RunEnd::Stopped);
-        assert_eq!(finished.verdict.overall, Overall::Inconclusive);
+        // Almost always stopped before a pass could finish; on a very busy
+        // machine a pass may have slipped in, which then counts.
+        let expected = if finished.summary.passes_completed == 0 {
+            Overall::Inconclusive
+        } else {
+            Overall::Pass
+        };
+        assert_eq!(finished.verdict.overall, expected);
+    }
+
+    #[test]
+    fn stopped_before_a_full_pass_is_inconclusive_and_remembers_nothing() {
+        let mut model = Model::demo(Demo::Pass);
+        model.finish(
+            TestSummary {
+                end: RunEnd::Stopped,
+                passes_completed: 0,
+                ..summary(0)
+            },
+            DAY1,
+        );
+        assert_eq!(
+            model.finished().unwrap().verdict.overall,
+            Overall::Inconclusive
+        );
         assert!(model.history.records().is_empty());
+        let statuses: Vec<Shown> = model.slot_views().into_iter().map(|v| v.shown).collect();
+        assert_eq!(
+            statuses,
+            vec![Shown::Empty, shown(Untested), Shown::Empty, shown(Untested)]
+        );
+    }
+
+    #[test]
+    fn an_endless_run_stopped_after_a_full_pass_passes_and_is_remembered() {
+        let _one_at_a_time = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut model = Model::demo(Demo::Pass);
+        model.length = Length::UntilStopped;
+        let config = small(&model);
+        assert_eq!(config.passes, None);
+        model.start_with(config);
+        // Wait until the second pass has begun, so at least one is complete.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            assert!(Instant::now() < deadline, "first pass never finished");
+            model.poll();
+            match &model.run {
+                RunState::Running(run) if run.progress.pass >= 2 => break,
+                RunState::Running(_) => std::thread::sleep(Duration::from_millis(1)),
+                _ => panic!("an endless run ended by itself"),
+            }
+        }
+        model.stop();
+        run_to_end(&mut model);
+        let finished = model.finished().unwrap();
+        assert_eq!(finished.summary.end, RunEnd::Stopped);
+        assert!(finished.summary.passes_completed >= 1);
+        assert_eq!(finished.verdict.overall, Overall::Pass);
+        assert!(
+            finished.verdict.advice.contains("before it was stopped"),
+            "{}",
+            finished.verdict.advice
+        );
+        let statuses: Vec<Shown> = model.slot_views().into_iter().map(|v| v.shown).collect();
+        assert_eq!(
+            statuses,
+            vec![Shown::Empty, shown(Passed), Shown::Empty, shown(Passed)]
+        );
+        let stored: Vec<StickStatus> = model.history.records().iter().map(|r| r.status).collect();
+        assert_eq!(stored, vec![Passed, Passed]);
+    }
+
+    /// Two sticks that report the same serial number.
+    fn twin() -> Slot {
+        slot(Some(stick(Some("SAME"))))
+    }
+
+    #[test]
+    fn twins_seen_together_then_tested_alone_show_and_remember_nothing() {
+        // All sticks in: errors, both suspect.
+        let mut model = Model::new(vec![twin(), twin()], empty_history());
+        model.finish(summary(1), DAY0);
+        assert_eq!(
+            model.finished().unwrap().verdict.overall,
+            Overall::FailMultiple
+        );
+
+        // The faulty twin alone: it fails, and that is shown for this run...
+        let mut faulty = Model::new(vec![twin(), slot(None)], model.history.clone());
+        faulty.finish(summary(1), DAY1);
+        assert_eq!(
+            faulty.finished().unwrap().verdict.overall,
+            Overall::FailSingle
+        );
+        assert_eq!(
+            faulty.slot_views()[0],
+            SlotShown {
+                shown: shown(Failed),
+                note: None
+            }
+        );
+        // ...but not remembered, and the window says so.
+        assert!(faulty.history.records().is_empty());
+        assert!(
+            faulty
+                .unremembered_note()
+                .is_some_and(|n| n.contains("this stick")),
+            "{:?}",
+            faulty.unremembered_note()
+        );
+
+        // The good twin alone: nothing is shown before the test, and its
+        // pass is shown as a pass, not as the other twin's failure.
+        let mut good = Model::new(vec![twin(), slot(None)], faulty.history.clone());
+        assert_eq!(
+            good.slot_views()[0],
+            SlotShown {
+                shown: shown(Untested),
+                note: None
+            }
+        );
+        good.finish(summary(0), DAY1 + 60);
+        assert_eq!(
+            good.slot_views()[0],
+            SlotShown {
+                shown: shown(Passed),
+                note: None
+            }
+        );
+        assert!(good.history.records().is_empty());
+        assert!(good.past_results().is_empty());
+    }
+
+    #[test]
+    fn unremembered_note_only_for_sticks_that_cannot_be_recognised() {
+        let mut model = Model::demo(Demo::Pass);
+        model.finish(summary(0), DAY1);
+        assert_eq!(model.unremembered_note(), None);
+
+        // One stick without a serial number, passing or failing alone.
+        for errors in [0, 1] {
+            let mut model = Model::new(vec![slot(Some(stick(None)))], empty_history());
+            model.finish(summary(errors), DAY1);
+            assert!(
+                model
+                    .unremembered_note()
+                    .is_some_and(|n| n.contains("this stick")),
+                "{errors} errors"
+            );
+        }
+
+        // Several sticks, one without a serial: a pass notes it, while the
+        // advice for several suspects already says it.
+        let mixed = vec![slot(Some(stick(Some("S")))), slot(Some(stick(None)))];
+        let mut model = Model::new(mixed.clone(), empty_history());
+        model.finish(summary(0), DAY1);
+        assert!(
+            model
+                .unremembered_note()
+                .is_some_and(|n| n.contains("some of these sticks"))
+        );
+        let mut model = Model::new(mixed, empty_history());
+        model.finish(summary(1), DAY1);
+        assert_eq!(
+            model.finished().unwrap().verdict.overall,
+            Overall::FailMultiple
+        );
+        assert_eq!(model.unremembered_note(), None);
+
+        // Nothing finished yet: no note.
+        assert_eq!(Model::demo(Demo::Pass).unremembered_note(), None);
     }
 
     #[test]

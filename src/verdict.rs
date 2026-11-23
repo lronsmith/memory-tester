@@ -6,13 +6,15 @@
 //! when it is the only one installed; with several installed, every installed
 //! stick becomes a suspect and the advice explains how to narrow it down.
 
-use crate::history::rememberable_keys;
+use crate::history::History;
 use crate::types::{RunEnd, Slot, StickStatus, TestSummary};
 
 /// The overall outcome of a run, in terms the UI can act on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overall {
-    /// Ran to the end with no errors.
+    /// No errors, and at least one full pass ran: the run either completed,
+    /// or was stopped after one or more full passes (which is how a run set
+    /// to go on until stopped ends).
     Pass,
     /// Errors found and exactly one stick is installed: that stick is bad.
     FailSingle,
@@ -22,10 +24,11 @@ pub enum Overall {
     /// were detected at all, or only one was detected while more memory was
     /// tested than it holds. Any detected sticks are `Suspect`.
     FailUnknownSticks,
-    /// Stopped early with no errors seen: proves nothing.
+    /// Stopped before the first full pass finished, with no errors seen:
+    /// proves nothing.
     Inconclusive,
-    /// Nothing was tested: no memory could be allocated, or the run tested
-    /// zero bytes.
+    /// Nothing was tested: no memory could be allocated, the run tested zero
+    /// bytes, or it completed without running a single pass.
     CouldNotTest,
 }
 
@@ -76,14 +79,22 @@ fn tenths_of_gb(bytes: u64) -> u128 {
 const ONE_AT_A_TIME: &str = "turn the computer off and unplug it, leave only one stick \
                              in, and test again, repeating for each stick";
 
-/// Judges a finished run.
+/// After this many clean passes the advice may call a fault unlikely; after
+/// fewer it only says that obvious faults would have shown.
+const PASSES_FOR_CONFIDENCE: u32 = 4;
+
+/// Judges a finished run. `history` says which sticks can have their result
+/// remembered, which the advice for several suspects mentions.
 ///
-/// Errors always win, however the run ended: if any were seen, the installed
-/// sticks are marked `Failed` (only one installed and it accounts for all the
-/// memory tested) or `Suspect` (otherwise). Without errors, a run that
-/// completed and tested something marks every installed stick `Passed`; any
-/// other run marks nothing.
-pub fn judge(slots: &[Slot], summary: &TestSummary) -> Verdict {
+/// - Errors always win, however the run ended: if any were seen, the
+///   installed sticks are marked `Failed` (only one installed and it accounts
+///   for all the memory tested) or `Suspect` (otherwise).
+/// - Without errors, a run that tested something and finished at least one
+///   full pass marks every installed stick `Passed`, whether it completed or
+///   was stopped after that pass.
+/// - A run stopped before its first full pass is `Inconclusive`, and any
+///   other run is `CouldNotTest`; neither marks anything.
+pub fn judge(slots: &[Slot], summary: &TestSummary, history: &History) -> Verdict {
     let installed: Vec<_> = slots.iter().filter_map(|s| s.stick.as_ref()).collect();
     let installed_bytes: u64 = installed
         .iter()
@@ -134,7 +145,7 @@ pub fn judge(slots: &[Slot], summary: &TestSummary) -> Verdict {
         // stick holds exactly when the results will be stored.
         let all_remembered = slots
             .iter()
-            .zip(rememberable_keys(slots))
+            .zip(history.rememberable_keys(slots))
             .all(|(slot, key)| slot.stick.is_none() || key.is_some());
         let ending = if all_remembered {
             "; this app remembers each stick's result."
@@ -153,17 +164,12 @@ pub fn judge(slots: &[Slot], summary: &TestSummary) -> Verdict {
         };
     }
 
+    let passes = summary.passes_completed;
+    let stopped = summary.end == RunEnd::Stopped;
+    let full_pass_ran =
+        summary.end != RunEnd::AllocationFailed && summary.tested_bytes > 0 && passes >= 1;
     match summary.end {
-        RunEnd::Stopped => Verdict {
-            overall: Overall::Inconclusive,
-            per_slot: mark(StickStatus::Untested),
-            headline: "Test stopped early".to_string(),
-            advice: "No errors were seen before the test was stopped, but a partial test \
-                     cannot show that the memory is healthy. Run the test to the end to \
-                     get a result."
-                .to_string(),
-        },
-        RunEnd::Completed if summary.tested_bytes > 0 => {
+        _ if full_pass_ran => {
             let tested = format_gb(summary.tested_bytes);
             // Compare with the installed total only when the numbers are
             // consistent; more tested than detected means detection is off.
@@ -171,23 +177,53 @@ pub fn judge(slots: &[Slot], summary: &TestSummary) -> Verdict {
                 format!("Tested {tested} of memory.")
             } else if tenths_of_gb(summary.tested_bytes) < tenths_of_gb(installed_bytes) {
                 format!(
-                    "Tested {tested} of {}; the rest was in use by Windows and other programs.",
+                    "Tested {tested} of {}; Windows and other programs were using some of the \
+                     rest, and some was left free on purpose to keep the PC responsive.",
                     format_gb(installed_bytes)
                 )
             } else {
                 format!("Tested {tested} of {}.", format_gb(installed_bytes))
             };
+            let count = match passes {
+                1 => "1 full pass".to_string(),
+                n => format!("{n} full passes"),
+            };
+            let ran = if stopped {
+                format!("The test ran {count} before it was stopped.")
+            } else {
+                format!("The test ran {count}.")
+            };
+            let certainty = match passes {
+                1 => {
+                    "A quick test like this catches obvious faults, but the thorough test, \
+                     or leaving it running for longer, is more certain."
+                }
+                n if n < PASSES_FOR_CONFIDENCE => {
+                    "A short test like this catches obvious faults, but the thorough test, \
+                     or leaving it running for longer, is more certain."
+                }
+                _ => {
+                    "A clean result over several passes makes a memory fault unlikely, but \
+                     faults that come and go can need a longer test."
+                }
+            };
             Verdict {
                 overall: Overall::Pass,
                 per_slot: mark(StickStatus::Passed),
                 headline: "No errors found".to_string(),
-                advice: format!(
-                    "{amount} A clean result makes a memory fault unlikely, but a longer \
-                     test is more certain."
-                ),
+                advice: format!("{amount} {ran} {certainty}"),
             }
         }
-        // No memory could be allocated, or the run tested zero bytes.
+        RunEnd::Stopped => Verdict {
+            overall: Overall::Inconclusive,
+            per_slot: mark(StickStatus::Untested),
+            headline: "Test stopped early".to_string(),
+            advice: "No errors were seen, but the test was stopped before it finished one \
+                     full pass, which is too little to show that the memory is healthy. \
+                     Start it again and let at least one pass finish."
+                .to_string(),
+        },
+        // No memory could be allocated, or nothing was tested.
         RunEnd::AllocationFailed | RunEnd::Completed => Verdict {
             overall: Overall::CouldNotTest,
             per_slot: mark(StickStatus::Untested),
@@ -234,6 +270,19 @@ mod tests {
             errors: Vec::new(),
             elapsed: Duration::from_secs(60),
         }
+    }
+
+    /// `summary` with `passes` full passes completed instead of one.
+    fn after(passes: u32, summary: TestSummary) -> TestSummary {
+        TestSummary {
+            passes_completed: passes,
+            ..summary
+        }
+    }
+
+    /// Judges with a history that has seen nothing.
+    fn judge(slots: &[Slot], summary: &TestSummary) -> Verdict {
+        super::judge(slots, summary, &History::in_memory())
     }
 
     /// Four slots: A1 empty, A2 16 GB, B1 empty, B2 16 GB.
@@ -303,7 +352,7 @@ mod tests {
         let v = judge(&one, &summary(RunEnd::Completed, 0, MIB));
         assert!(
             v.advice
-                .starts_with("Tested less than 0.1 GB of 16 GB; the rest was in use"),
+                .starts_with("Tested less than 0.1 GB of 16 GB; Windows and other programs"),
             "{}",
             v.advice
         );
@@ -362,13 +411,100 @@ mod tests {
     fn pass_advice_states_tested_and_installed_amounts() {
         let slots = two_of_four();
         let v = judge(&slots, &summary(RunEnd::Completed, 0, 28 * GIB));
+        assert_eq!(
+            v.advice,
+            "Tested 28 GB of 32 GB; Windows and other programs were using some of the rest, \
+             and some was left free on purpose to keep the PC responsive. The test ran 1 \
+             full pass. A quick test like this catches obvious faults, but the thorough \
+             test, or leaving it running for longer, is more certain."
+        );
+    }
+
+    #[test]
+    fn pass_advice_claims_more_only_after_more_passes() {
+        let slots = vec![slot("A1", Some(stick(8192, Some("S"))))];
+        let advice = |passes: u32, end: RunEnd| {
+            judge(&slots, &after(passes, summary(end, 0, 8 * GIB))).advice
+        };
+        // One pass: obvious faults only, and how to be more certain.
+        let one = advice(1, RunEnd::Completed);
+        assert!(one.contains("The test ran 1 full pass."), "{one}");
+        assert!(one.contains("quick test"), "{one}");
+        assert!(one.contains("thorough test"), "{one}");
+        assert!(one.contains("running for longer"), "{one}");
+        assert!(!one.contains("unlikely"), "{one}");
+        // Two or three passes: still no claim that a fault is unlikely.
+        let three = advice(3, RunEnd::Completed);
+        assert!(three.contains("The test ran 3 full passes."), "{three}");
+        assert!(three.contains("short test"), "{three}");
+        assert!(!three.contains("unlikely"), "{three}");
+        // Four or more: the stronger wording.
+        for passes in [4, 60] {
+            let many = advice(passes, RunEnd::Completed);
+            assert!(
+                many.contains(&format!("The test ran {passes} full passes.")),
+                "{many}"
+            );
+            assert!(many.contains("unlikely"), "{many}");
+            assert!(!many.contains("quick test"), "{many}");
+        }
+    }
+
+    #[test]
+    fn stopped_after_full_passes_is_a_pass_that_says_how_many() {
+        let slots = two_of_four();
+        let v = judge(&slots, &after(3, summary(RunEnd::Stopped, 0, 28 * GIB)));
+        assert_eq!(v.overall, Overall::Pass);
+        assert_eq!(v.per_slot, vec![Untested, Passed, Untested, Passed]);
+        assert_eq!(v.headline, "No errors found");
         assert!(
             v.advice
-                .starts_with("Tested 28 GB of 32 GB; the rest was in use"),
+                .contains("The test ran 3 full passes before it was stopped."),
             "{}",
             v.advice
         );
-        assert!(v.advice.contains("longer test"), "{}", v.advice);
+
+        let v = judge(&slots, &after(1, summary(RunEnd::Stopped, 0, 28 * GIB)));
+        assert_eq!(v.overall, Overall::Pass);
+        assert!(
+            v.advice
+                .contains("The test ran 1 full pass before it was stopped."),
+            "{}",
+            v.advice
+        );
+
+        // An hour of an endless run: many passes, the stronger wording.
+        let v = judge(&slots, &after(80, summary(RunEnd::Stopped, 0, 28 * GIB)));
+        assert_eq!(v.overall, Overall::Pass);
+        assert!(v.advice.contains("80 full passes before"), "{}", v.advice);
+        assert!(v.advice.contains("unlikely"), "{}", v.advice);
+    }
+
+    #[test]
+    fn a_key_seen_shared_before_is_not_promised_to_be_remembered() {
+        let twin = || stick(8192, Some("SAME"));
+        let mut history = History::in_memory();
+        // Both twins were installed together once.
+        let together = vec![slot("A1", Some(twin())), slot("A2", Some(twin()))];
+        let seen = super::judge(
+            &together,
+            &summary(RunEnd::Completed, 1, 12 * GIB),
+            &history,
+        );
+        history.apply(&together, &seen, 1);
+        // Now one twin is tested with a different stick: its serial is unique
+        // here, but this app will not store its result.
+        let now = vec![
+            slot("A1", Some(twin())),
+            slot("A2", Some(stick(8192, Some("OTHER")))),
+        ];
+        let v = super::judge(&now, &summary(RunEnd::Completed, 1, 12 * GIB), &history);
+        assert_eq!(v.overall, Overall::FailMultiple);
+        assert!(!v.advice.contains("remembers"), "{}", v.advice);
+        assert!(v.advice.contains("write each result down"), "{}", v.advice);
+        // A history that has not seen them together still promises.
+        let fresh = judge(&now, &summary(RunEnd::Completed, 1, 12 * GIB));
+        assert!(fresh.advice.contains("remembers"), "{}", fresh.advice);
     }
 
     #[test]
@@ -486,11 +622,32 @@ mod tests {
     }
 
     #[test]
-    fn stopped_without_errors_is_inconclusive() {
-        let v = judge(&two_of_four(), &summary(RunEnd::Stopped, 0, 28 * GIB));
+    fn stopped_before_the_first_full_pass_is_inconclusive() {
+        let v = judge(
+            &two_of_four(),
+            &after(0, summary(RunEnd::Stopped, 0, 28 * GIB)),
+        );
         assert_eq!(v.overall, Overall::Inconclusive);
         assert_eq!(v.per_slot, vec![Untested; 4]);
-        assert!(v.advice.contains("stopped"), "{}", v.advice);
+        assert_eq!(v.headline, "Test stopped early");
+        assert!(
+            v.advice.contains("before it finished one full pass"),
+            "{}",
+            v.advice
+        );
+        // It asks for something possible even for a run that never ends.
+        assert!(!v.advice.contains("to the end"), "{}", v.advice);
+        assert!(v.advice.contains("at least one pass"), "{}", v.advice);
+    }
+
+    #[test]
+    fn completed_without_a_single_pass_is_not_a_pass() {
+        let v = judge(
+            &two_of_four(),
+            &after(0, summary(RunEnd::Completed, 0, 28 * GIB)),
+        );
+        assert_eq!(v.overall, Overall::CouldNotTest);
+        assert_eq!(v.per_slot, vec![Untested; 4]);
     }
 
     #[test]
@@ -504,8 +661,25 @@ mod tests {
             ),
             judge(&[], &summary(RunEnd::Completed, 1, GIB)),
             judge(&[], &summary(RunEnd::Completed, 0, GIB)),
-            judge(&two_of_four(), &summary(RunEnd::Stopped, 0, GIB)),
+            judge(&two_of_four(), &after(0, summary(RunEnd::Stopped, 0, GIB))),
             judge(&two_of_four(), &summary(RunEnd::AllocationFailed, 0, 0)),
+            // Pass after several passes, completed or stopped.
+            judge(
+                &two_of_four(),
+                &after(2, summary(RunEnd::Completed, 0, 28 * GIB)),
+            ),
+            judge(
+                &two_of_four(),
+                &after(4, summary(RunEnd::Completed, 0, 28 * GIB)),
+            ),
+            judge(
+                &two_of_four(),
+                &after(1, summary(RunEnd::Stopped, 0, 28 * GIB)),
+            ),
+            judge(
+                &two_of_four(),
+                &after(90, summary(RunEnd::Stopped, 0, 28 * GIB)),
+            ),
             // FailMultiple without the remember promise.
             judge(
                 &[

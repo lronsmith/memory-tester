@@ -145,7 +145,7 @@ impl App {
         self.header(ui);
         ui.add_space(12.0);
         if let Some(finished) = self.model.finished() {
-            result_banner(ui, finished);
+            result_banner(ui, finished, self.model.unremembered_note());
             ui.add_space(14.0);
         }
         self.sticks(ui);
@@ -438,8 +438,9 @@ fn put_text(
     }
 }
 
-/// The large coloured result banner with the verdict's words.
-fn result_banner(ui: &mut Ui, finished: &super::model::Finished) {
+/// The large coloured result banner with the verdict's words, and any small
+/// notes about how far to trust or keep the result.
+fn result_banner(ui: &mut Ui, finished: &super::model::Finished, unremembered: Option<&str>) {
     let status = overall_status(Some(finished.verdict.overall));
     let look = draw::look(Shown::Status(status));
     egui::Frame::new()
@@ -464,8 +465,9 @@ fn result_banner(ui: &mut Ui, finished: &super::model::Finished) {
             ui.add_space(4.0);
             ui.label(RichText::new(&finished.verdict.advice).color(INK));
             let notes = text::lock_note(&finished.summary)
-                .map(str::to_string)
                 .into_iter()
+                .chain(unremembered)
+                .map(str::to_string)
                 .chain(finished.save_error.clone());
             for note in notes {
                 ui.add_space(2.0);

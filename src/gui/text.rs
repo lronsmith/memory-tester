@@ -95,30 +95,57 @@ pub fn installed_summary(slots: &[Slot]) -> String {
     }
 }
 
-/// The caption for a result shown from an earlier run.
+/// The caption for a result shown from an earlier run. Results are matched by
+/// serial number, and two sticks that are never installed together can
+/// report the same one, so it says how the stick was recognised.
 pub fn remembered_note(when_unix: u64) -> String {
     format!(
-        "Remembered from {}",
+        "Remembered by serial number from {}",
         memory_tester::history::format_date(when_unix)
     )
 }
 
 /// The caption for a stick that passed this run but is remembered as failed
-/// (and so is still shown as failed).
+/// (and so is still shown as failed). It speaks of the serial number rather
+/// than "this stick", because the failure may belong to another stick that
+/// reports the same serial.
 pub fn passed_but_failed_note(failed_unix: u64) -> String {
     format!(
-        "Passed this time, but failed on {}. A faulty stick can pass a short test.",
+        "Passed this time, but a stick with this serial number failed on {}. \
+         A faulty stick can pass a short test.",
         memory_tester::history::format_date(failed_unix)
     )
 }
 
-/// The caption for a stick that is a suspect in this run and failed on its
-/// own earlier. Only failures of a stick tested alone are remembered.
+/// The caption for a stick that is a suspect in this run when a stick with
+/// its serial number failed on its own earlier. Only failures of a stick
+/// tested alone are remembered.
 pub fn failed_alone_note(failed_unix: u64) -> String {
     format!(
-        "Failed when tested alone on {}.",
+        "A stick with this serial number failed when tested alone on {}.",
         memory_tester::history::format_date(failed_unix)
     )
+}
+
+/// The note for a result that will not be remembered, given how many
+/// installed sticks this app cannot recognise later and how many are
+/// installed; `None` when every installed stick can be recognised.
+pub fn unremembered_note(unrecognised: usize, installed: usize) -> Option<&'static str> {
+    match (unrecognised, installed) {
+        (0, _) => None,
+        (_, 1) => Some(
+            "This app has no way to recognise this stick next time, so it will not \
+             remember this result. Write it down.",
+        ),
+        (n, total) if n >= total => Some(
+            "This app has no way to recognise these sticks next time, so it will not \
+             remember these results. Write them down.",
+        ),
+        _ => Some(
+            "This app has no way to recognise some of these sticks next time, so it will \
+             not remember their results. Write them down.",
+        ),
+    }
 }
 
 /// Heading and caption of the list of remembered results for sticks that
@@ -201,12 +228,17 @@ pub const PART_SEPARATOR: &str = " · ";
 /// look like a restart:
 /// "Step 1 of 2: getting memory ready · 00:12", then
 /// "Step 2 of 2: testing · Pass 1 of 4 · Checkerboard · 52 GB under test · 0 errors · 01:23".
+/// Once every pass is done, while the memory is being given back, it is
+/// "Finishing… · 0 errors · 01:23".
 pub fn status_parts(progress: &Progress) -> Vec<Part> {
     let time = part(format_elapsed(progress.elapsed));
     let errors = Part {
         text: error_count_text(progress.error_count),
         alert: progress.error_count > 0,
     };
+    if all_passes_done(progress) {
+        return vec![part("Finishing…"), errors, time];
+    }
     match progress.phase {
         Phase::Allocating => {
             let mut parts = vec![part("Step 1 of 2: getting memory ready")];
@@ -237,6 +269,13 @@ pub fn status_parts(progress: &Progress) -> Vec<Part> {
     }
 }
 
+/// True once a run with a fixed number of passes has done all of them, so
+/// what is left is giving the memory back. That can take a few seconds with
+/// tens of GB, and the result appears only after it.
+fn all_passes_done(progress: &Progress) -> bool {
+    progress.phase == Phase::Testing && progress.overall_fraction.is_some_and(|f| f >= 1.0)
+}
+
 /// Which step of a run the progress bar is showing; the two are drawn in
 /// different colours.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,8 +300,9 @@ pub struct Bar {
 
 /// The progress bar for a snapshot. While memory is being allocated it shows
 /// how much has been obtained, labelled as such, once that is known. Runs
-/// with a fixed number of passes then show overall progress; runs that go on
-/// until stopped show the current pass's progress and its number.
+/// with a fixed number of passes then show overall progress, and
+/// "Finishing…" once every pass is done; runs that go on until stopped show
+/// the current pass's progress and its number.
 pub fn progress_bar(progress: &Progress) -> Bar {
     let testing = |fraction: f32, label: String| Bar {
         stage: Stage::Testing,
@@ -280,6 +320,7 @@ pub fn progress_bar(progress: &Progress) -> Bar {
             fraction: None,
             label: "Getting memory ready…".to_string(),
         },
+        _ if all_passes_done(progress) => testing(1.0, "Finishing…".to_string()),
         Phase::Testing | Phase::Finished => match progress.overall_fraction {
             Some(overall) => testing(overall, format!("{}%", percent(overall))),
             None => testing(
@@ -536,16 +577,34 @@ mod tests {
     }
 
     #[test]
-    fn notes_carry_the_date() {
-        assert_eq!(remembered_note(1_795_392_000), "Remembered from 2026-11-23");
+    fn notes_carry_the_date_and_claim_only_the_serial_number() {
+        assert_eq!(
+            remembered_note(1_795_392_000),
+            "Remembered by serial number from 2026-11-23"
+        );
         assert_eq!(
             passed_but_failed_note(1_795_392_000),
-            "Passed this time, but failed on 2026-11-23. A faulty stick can pass a short test."
+            "Passed this time, but a stick with this serial number failed on 2026-11-23. \
+             A faulty stick can pass a short test."
         );
         assert_eq!(
             failed_alone_note(1_795_392_000),
-            "Failed when tested alone on 2026-11-23."
+            "A stick with this serial number failed when tested alone on 2026-11-23."
         );
+    }
+
+    #[test]
+    fn unremembered_note_only_when_a_stick_cannot_be_recognised() {
+        assert_eq!(unremembered_note(0, 1), None);
+        assert_eq!(unremembered_note(0, 4), None);
+        let one = unremembered_note(1, 1).unwrap();
+        assert!(one.contains("this stick"), "{one}");
+        assert!(one.ends_with("Write it down."), "{one}");
+        let all = unremembered_note(2, 2).unwrap();
+        assert!(all.contains("these sticks"), "{all}");
+        let some = unremembered_note(1, 3).unwrap();
+        assert!(some.contains("some of these sticks"), "{some}");
+        assert!(some.ends_with("Write them down."), "{some}");
     }
 
     #[test]
@@ -655,6 +714,42 @@ mod tests {
             status_line(&progress(Phase::Finished)),
             "Finishing… · 0 errors · 01:23"
         );
+    }
+
+    #[test]
+    fn finishing_is_shown_once_every_pass_is_done() {
+        // The last pass is done but the memory is still being given back:
+        // the engine still reports `Testing`.
+        let done = Progress {
+            pass: 4,
+            pass_fraction: 1.0,
+            overall_fraction: Some(1.0),
+            error_count: 2,
+            ..progress(Phase::Testing)
+        };
+        assert_eq!(status_line(&done), "Finishing… · 2 errors · 01:23");
+        assert_eq!(
+            progress_bar(&done),
+            Bar {
+                stage: Stage::Testing,
+                fraction: Some(1.0),
+                label: "Finishing…".to_string()
+            }
+        );
+        // Just short of the end is still testing.
+        let nearly = Progress {
+            overall_fraction: Some(0.999),
+            ..done
+        };
+        assert!(status_line(&nearly).starts_with("Step 2 of 2: testing"));
+        assert_eq!(progress_bar(&nearly).label, "99%");
+        // A run that goes on until stopped never looks finished by itself.
+        let endless = Progress {
+            total_passes: None,
+            overall_fraction: None,
+            ..done
+        };
+        assert!(status_line(&endless).starts_with("Step 2 of 2: testing"));
     }
 
     #[test]
