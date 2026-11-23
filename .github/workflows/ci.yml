@@ -1,27 +1,166 @@
+# One workflow for checks and releases.
+#
+# - Every push to any branch, and every pull request: the `build` job checks
+#   formatting, runs clippy and the tests, builds the release exe and uploads
+#   it as a workflow artifact.
+# - Pushing a tag like v0.1.0: the same `build` job runs (after first checking
+#   that the tag matches the version in Cargo.toml), then the `release` job
+#   publishes that exact exe and its SHA-256 as a GitHub Release.
+
 name: CI
 
 on:
   push:
     branches: ["**"]
+    tags: ["v*.*.*"]
   pull_request:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded branch and pull request runs are cancelled. Tag runs are never
+  # cancelled, so a release is not interrupted halfway through publishing.
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental build files only bloat the cache on CI; they never get reused.
+  CARGO_INCREMENTAL: "0"
+
 jobs:
-  windows:
+  build:
     runs-on: windows-latest
+    defaults:
+      run:
+        # Git Bash, for every step: one quoting and variable syntax throughout,
+        # instead of the PowerShell default.
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
-      - name: Show toolchain
-        run: rustc --version && cargo --version
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        id: toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+          rustup default stable
+          rustc -Vv
+          cargo -V
+          echo "commit=$(rustc -Vv | tr -d '\r' | sed -n 's/^commit-hash: //p')" >> "$GITHUB_OUTPUT"
+
+      - name: Check tag matches Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          # `cargo pkgid` prints e.g. "path+file:///D:/a/x/memory-tester#0.1.0"
+          # or "...#memory-tester@0.1.0"; the version is after the last # or @.
+          pkgid="$(cargo pkgid)"
+          version="${pkgid##*[#@]}"
+          if [ "${TAG#v}" != "$version" ]; then
+            echo "::error::Tag $TAG does not match version $version in Cargo.toml. Set version = \"${TAG#v}\" in Cargo.toml (or tag v$version) and push again."
+            exit 1
+          fi
+          echo "Tag $TAG matches Cargo.toml version $version."
+
+      - name: Cache cargo registry and build output
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.commit }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ steps.toolchain.outputs.commit }}-
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --all-targets -- --nocapture
-      - name: Build release
+
+      - name: Build release exe
         run: cargo build --release
+
+      - name: Check the exe does not need the Visual C++ runtime DLL
+        run: |
+          # With the C runtime linked statically (.cargo/config.toml) the exe
+          # has no import of VCRUNTIME140.dll; if that name appears, it does.
+          if grep -qai 'vcruntime140' target/release/memory-tester.exe; then
+            echo "::error::memory-tester.exe imports VCRUNTIME140.dll; the C runtime is not statically linked."
+            exit 1
+          fi
+          echo "No VCRUNTIME140.dll reference found."
+
       - name: Upload exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: memory-tester-windows-x64
           path: target/release/memory-tester.exe
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download exe built by the build job
+        uses: actions/download-artifact@v8
+        with:
+          name: memory-tester-windows-x64
+          path: dist
+
+      - name: Write SHA-256 checksum
+        working-directory: dist
+        run: |
+          sha256sum memory-tester.exe > memory-tester.exe.sha256
+          cat memory-tester.exe.sha256
+
+      - name: Publish GitHub Release
+        run: |
+          # No release for the tag yet: create it. A published release already
+          # exists (a re-run): replace both assets in place, keeping the
+          # release, its notes and its URL; during the replacement the
+          # latest/download link briefly returns 404, and if the upload fails
+          # the step fails and a re-run completes it. A draft release or any
+          # other error from GitHub: stop with a clear message.
+          assets=(dist/memory-tester.exe dist/memory-tester.exe.sha256)
+          view_err="$RUNNER_TEMP/release-view-error.txt"
+          if is_draft="$(gh release view "$TAG" --json isDraft --jq .isDraft 2> "$view_err")"; then
+            if [ "$is_draft" = "true" ]; then
+              echo "::error::Release $TAG exists but is a draft, probably left by an earlier failed run. Publish or delete it on GitHub, then re-run this job."
+              exit 1
+            fi
+            echo "Release $TAG already exists; replacing its assets."
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          elif grep -q 'release not found' "$view_err"; then
+            gh release create "$TAG" "${assets[@]}" --title "$TAG" --generate-notes --verify-tag
+          else
+            echo "::error::Could not check whether release $TAG exists: $(cat "$view_err")"
+            exit 1
+          fi
+
+          # Confirm both assets are on the release.
+          names="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+          for name in memory-tester.exe memory-tester.exe.sha256; do
+            if ! grep -qxF "$name" <<< "$names"; then
+              echo "::error::Release $TAG is missing asset $name after publishing."
+              exit 1
+            fi
+          done
+          echo "Release $TAG has memory-tester.exe and memory-tester.exe.sha256."
