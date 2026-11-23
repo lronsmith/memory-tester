@@ -123,11 +123,10 @@ pub fn judge(slots: &[Slot], summary: &TestSummary) -> Verdict {
                 overall: Overall::FailSingle,
                 per_slot: mark(StickStatus::Failed),
                 headline: "This memory stick failed the test".to_string(),
-                advice: "This memory stick failed the test. If your other sticks pass when \
-                         each is tested alone in this same slot, this one is faulty and should \
-                         be replaced; memory often has a lifetime warranty. If every stick \
-                         fails, the cause is more likely the motherboard or its memory speed \
-                         setting than the sticks."
+                advice: "If your other sticks pass when each is tested alone in this same \
+                         slot, this one is faulty and should be replaced; memory often has a \
+                         lifetime warranty. If every stick fails, the cause is more likely the \
+                         motherboard or its memory speed setting than the sticks."
                     .to_string(),
             };
         }
@@ -529,6 +528,15 @@ mod tests {
         ];
         for v in cases {
             assert!(!v.headline.is_empty());
+            // The advice is shown right under the headline, so it must not
+            // repeat it.
+            let headline = v.headline.to_lowercase();
+            assert!(
+                !v.advice.to_lowercase().contains(&headline),
+                "advice repeats the headline: {} / {}",
+                v.headline,
+                v.advice
+            );
             assert!(!v.advice.contains('!'), "{}", v.advice);
             assert!(!v.headline.contains('!'), "{}", v.headline);
             assert!(!v.advice.contains("  "), "double space: {}", v.advice);
