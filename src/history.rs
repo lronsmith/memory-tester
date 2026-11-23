@@ -90,7 +90,8 @@ pub struct Record {
 pub struct History {
     /// At most one record per key, oldest first.
     records: Vec<Record>,
-    path: PathBuf,
+    /// The file `save` writes; `None` for a history kept in memory only.
+    path: Option<PathBuf>,
 }
 
 impl History {
@@ -99,7 +100,7 @@ impl History {
     pub fn load(path: &Path) -> History {
         let mut history = History {
             records: Vec::new(),
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
         };
         if let Some(bytes) = read_small_file(path) {
             for record in parse(&bytes) {
@@ -108,6 +109,16 @@ impl History {
             history.sort();
         }
         history
+    }
+
+    /// An empty history with no file behind it: results are kept while the
+    /// program runs and [`History::save`] does nothing. For demonstrations,
+    /// which must never touch the real history file.
+    pub fn in_memory() -> History {
+        History {
+            records: Vec::new(),
+            path: None,
+        }
     }
 
     /// Loads from the default location (see [`default_path`]).
@@ -155,16 +166,20 @@ impl History {
         changed
     }
 
-    /// Writes the file. Creates the folder if needed.
+    /// Writes the file. Creates the folder if needed. For a history made
+    /// with [`History::in_memory`] this does nothing and returns `Ok`.
     ///
     /// The data goes to a temporary file in the same folder first, which is
     /// then renamed over the real file, so a crash mid-write cannot leave a
     /// half-written history behind.
     pub fn save(&self) -> io::Result<()> {
-        let file_name = self.path.file_name().ok_or_else(|| {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        let file_name = path.file_name().ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "history path has no file name")
         })?;
-        let folder = self.path.parent().unwrap_or(Path::new(""));
+        let folder = path.parent().unwrap_or(Path::new(""));
         if !folder.as_os_str().is_empty() {
             std::fs::create_dir_all(folder)?;
         }
@@ -176,7 +191,7 @@ impl History {
 
         let result = write_and_sync(&temp, self.to_text().as_bytes()).and_then(|()| {
             with_retries(RENAME_ATTEMPTS, RENAME_PAUSE, || {
-                std::fs::rename(&temp, &self.path)
+                std::fs::rename(&temp, path)
             })
         });
         if result.is_err() {
@@ -656,6 +671,18 @@ mod tests {
         let order: Vec<u64> = h.records().iter().map(|r| r.when_unix).collect();
         assert_eq!(order, vec![200, 300]);
         assert_eq!(h.records()[0].key, key("B"));
+    }
+
+    #[test]
+    fn in_memory_history_keeps_results_and_saving_is_a_no_op() {
+        let mut h = History::in_memory();
+        assert!(h.records().is_empty());
+        assert!(h.apply(&[slot(Some(stick(Some("A"))))], &verdict(vec![Failed]), 9));
+        h.save().unwrap();
+        assert_eq!(h.get(&key("A")).unwrap().status, Failed);
+        h.clear();
+        h.save().unwrap();
+        assert!(h.records().is_empty());
     }
 
     #[test]

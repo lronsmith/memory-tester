@@ -10,8 +10,8 @@ use eframe::egui::{
 use memory_tester::types::StickStatus;
 
 use super::draw::{self, INK, INK_SOFT};
-use super::model::{Model, RunState, overall_status};
-use super::text::{self, Bar, Shown};
+use super::model::{CloseAction, Model, RunState, overall_status};
+use super::text::{self, Bar, Shown, Stage};
 
 /// How often the window redraws while a run is going.
 const RUNNING_REPAINT: Duration = Duration::from_millis(100);
@@ -30,8 +30,6 @@ pub struct App {
     model: Model,
     /// Physical memory size from the OS, for the "Installed memory" block.
     total_bytes: Option<u64>,
-    /// The window was closed during a run: close it once the run has stopped.
-    close_when_stopped: bool,
     #[cfg(feature = "screenshot")]
     capture: Option<super::screenshot::Capture>,
 }
@@ -43,7 +41,6 @@ impl App {
         App {
             model,
             total_bytes: memory_tester::engine::total_physical_bytes(),
-            close_when_stopped: false,
             #[cfg(feature = "screenshot")]
             capture: None,
         }
@@ -55,29 +52,33 @@ impl App {
         self.capture = Some(capture);
         self
     }
-
-    /// Closing the window during a run: stop the run first, keep the window
-    /// responsive while it winds down, then close.
-    fn handle_close(&mut self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().close_requested()) && self.model.is_running() {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.model.stop();
-            self.close_when_stopped = true;
-        }
-        if self.close_when_stopped && !self.model.is_running() {
-            ctx.send_viewport_cmd(ViewportCommand::Close);
-        }
-    }
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
+    /// Runs before every frame and also while the window is minimised or
+    /// hidden, so a run's end is noticed and saved, and a close is handled,
+    /// even when nothing is drawn.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.model.poll();
-        self.handle_close(&ctx);
+        // Closing during a run: keep the window (and its event loop) alive
+        // while the run stops and gives its memory back, then close.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.model.request_close() == CloseAction::WaitForStop
+        {
+            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        }
+        if self.model.ready_to_close() {
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+        if self.model.is_running() {
+            ctx.request_repaint_after(RUNNING_REPAINT);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         #[cfg(feature = "screenshot")]
         if let Some(capture) = &mut self.capture {
-            capture.step(&ctx, &mut self.model);
+            capture.step(ui.ctx(), &mut self.model);
         }
 
         egui::Panel::bottom("controls")
@@ -100,15 +101,11 @@ impl eframe::App for App {
                             .show(ui, |ui| self.body(ui));
                     });
             });
-
-        if self.model.is_running() {
-            ctx.request_repaint_after(RUNNING_REPAINT);
-        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        // Normally the run has already stopped (see `handle_close`); this
-        // also covers any other way the window goes away.
+        // Normally the run has already stopped (see `logic`); this also
+        // covers any other way the window goes away.
         self.model.stop_and_wait();
     }
 
@@ -159,7 +156,11 @@ impl App {
         let past = self.model.past_results();
         if !past.is_empty() {
             ui.add_space(14.0);
-            past_results(ui, &past);
+            past_results(
+                ui,
+                &past,
+                text::past_results_heading(self.model.sticks_unknown()),
+            );
         }
         let has_saved = !self.model.history.records().is_empty();
         if !self.model.is_running() && (has_saved || self.model.forget_error.is_some()) {
@@ -503,14 +504,11 @@ fn details(ui: &mut Ui, finished: &super::model::Finished) {
         });
 }
 
-/// The compact list of remembered sticks that are not installed now.
-fn past_results(ui: &mut Ui, past: &[super::model::PastResult]) {
-    ui.label(RichText::new("Previously tested").size(16.5));
-    ui.label(
-        RichText::new("Sticks this app remembers that are not in the computer now.")
-            .small()
-            .color(INK_SOFT),
-    );
+/// The compact list of remembered sticks that are not detected now.
+fn past_results(ui: &mut Ui, past: &[super::model::PastResult], heading: (&str, &str)) {
+    let (title, caption) = heading;
+    ui.label(RichText::new(title).size(16.5));
+    ui.label(RichText::new(caption).small().color(INK_SOFT));
     ui.add_space(4.0);
     egui::Frame::new()
         .fill(Color32::WHITE)
@@ -519,8 +517,10 @@ fn past_results(ui: &mut Ui, past: &[super::model::PastResult]) {
         .inner_margin(Margin::symmetric(12, 8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            for (i, row) in past.iter().enumerate() {
+            for row in past {
                 let shown = Shown::Status(row.status);
+                // Every piece is a widget in one centred row, so they share
+                // a baseline.
                 ui.horizontal(|ui| {
                     let (dot, _) = ui.allocate_exact_size(vec2(12.0, 18.0), Sense::hover());
                     draw::dot(ui.painter(), dot.center(), shown);
@@ -533,11 +533,9 @@ fn past_results(ui: &mut Ui, past: &[super::model::PastResult]) {
                             egui::Label::new(RichText::new(word).color(draw::look(shown).ink)),
                         );
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                            let font = draw::font(ui, TextStyle::Body);
-                            let w = ui.available_width();
-                            let y = ui.cursor().top() + (18.0 - line_height(ui, &font) + 3.0) / 2.0;
-                            let x = ui.cursor().left();
-                            put_text(ui, &row.label, font, INK, x, y, w, (usize::MAX, i));
+                            ui.add(
+                                egui::Label::new(RichText::new(&row.label).color(INK)).truncate(),
+                            );
                         });
                     });
                 });
@@ -609,10 +607,11 @@ impl App {
         }
     }
 
-    /// "Forget saved results", which asks once before it acts.
+    /// "Forget saved results" ("Forget remembered results" in demo mode),
+    /// which asks once before it acts.
     fn forget_control(&mut self, ui: &mut Ui) {
         if self.model.confirm_forget {
-            ui.label(RichText::new("Forget all saved results?").color(INK_SOFT));
+            ui.label(RichText::new("Are you sure?").color(INK_SOFT));
             if ui.button("Forget them").clicked() {
                 self.model.forget();
             }
@@ -621,7 +620,7 @@ impl App {
             }
         } else if !self.model.history.records().is_empty() {
             let link = egui::Button::new(
-                RichText::new("Forget saved results")
+                RichText::new(text::forget_link_text(self.model.persists()))
                     .small()
                     .color(INK_SOFT),
             )
@@ -636,15 +635,21 @@ impl App {
     }
 }
 
-/// A full-width progress bar; when nothing is measurable yet, a band slides
-/// along it to show activity.
+/// A full-width progress bar. Getting memory ready is drawn in a light,
+/// secondary blue with dark text, testing in the strong accent blue, so the
+/// bar starting again from zero for the test does not look like a restart.
+/// When nothing is measurable yet, a band slides along it to show activity.
 fn progress_bar(ui: &mut Ui, bar: &Bar) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
     let painter = ui.painter();
     let radius = CornerRadius::same(6);
     painter.rect_filled(rect, radius, Color32::from_rgb(0xE5, 0xE8, 0xEC));
-    match bar {
-        Bar::Busy => {
+    let (fill_color, filled_text) = match bar.stage {
+        Stage::Preparing => (draw::ACCENT_SOFT, INK),
+        Stage::Testing => (draw::ACCENT, Color32::WHITE),
+    };
+    let filled_to = match bar.fraction {
+        None => {
             let t = ui.input(|i| i.time);
             let band = rect.width() * 0.25;
             let travel = rect.width() + band;
@@ -654,30 +659,32 @@ fn progress_bar(ui: &mut Ui, bar: &Bar) {
                 pos2((x + band).min(rect.right()), rect.bottom()),
             );
             if fill.width() > 0.0 {
-                painter.rect_filled(fill, radius, Color32::from_rgb(0x9D, 0xB7, 0xE8));
+                painter.rect_filled(fill, radius, fill_color);
             }
+            rect.left()
         }
-        Bar::Fill { fraction, label } => {
-            let w = (rect.width() * fraction).max(if *fraction > 0.0 { 12.0 } else { 0.0 });
+        Some(fraction) => {
+            let w = (rect.width() * fraction).max(if fraction > 0.0 { 12.0 } else { 0.0 });
             if w > 0.0 {
                 let fill = Rect::from_min_size(rect.min, vec2(w, rect.height()));
-                painter.rect_filled(fill, radius, draw::ACCENT);
+                painter.rect_filled(fill, radius, fill_color);
             }
-            // The label sits centred; dark on the track, white where filled.
-            let font = draw::font(ui, TextStyle::Body);
-            let galley = painter.layout_no_wrap(label.clone(), font, INK);
-            let pos = rect.center() - galley.size() / 2.0;
-            let text_rect = Rect::from_min_size(pos, galley.size());
-            let filled_to = rect.left() + w;
-            painter
-                .with_clip_rect(Rect::from_min_max(pos2(filled_to, rect.top()), rect.max))
-                .galley(pos, galley.clone(), INK);
-            if filled_to > text_rect.left() {
-                painter
-                    .with_clip_rect(Rect::from_min_max(rect.min, pos2(filled_to, rect.bottom())))
-                    .galley_with_override_text_color(pos, galley, Color32::WHITE);
-            }
+            rect.left() + w
         }
+    };
+    // The label sits centred: dark on the track, and in `filled_text` where
+    // the bar is filled.
+    let font = draw::font(ui, TextStyle::Body);
+    let galley = painter.layout_no_wrap(bar.label.clone(), font, INK);
+    let pos = rect.center() - galley.size() / 2.0;
+    let text_rect = Rect::from_min_size(pos, galley.size());
+    painter
+        .with_clip_rect(Rect::from_min_max(pos2(filled_to, rect.top()), rect.max))
+        .galley(pos, galley.clone(), INK);
+    if filled_to > text_rect.left() {
+        painter
+            .with_clip_rect(Rect::from_min_max(rect.min, pos2(filled_to, rect.bottom())))
+            .galley_with_override_text_color(pos, galley, filled_text);
     }
 }
 

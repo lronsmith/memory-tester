@@ -1,8 +1,6 @@
 //! The pretend computers behind `--demo=<name>`. Their sticks are made up,
 //! but the memory test itself is real (capped at [`DEMO_MAX_BYTES`]).
 
-use std::path::Path;
-
 use memory_tester::history::History;
 use memory_tester::types::{Slot, Stick, StickStatus};
 use memory_tester::verdict::{Overall, Verdict};
@@ -59,10 +57,8 @@ impl Demo {
     /// sticks that are not installed, so every part of the window that shows
     /// remembered results has something in it. The others start empty.
     pub fn history(self) -> History {
-        // An empty path cannot be opened, so this is an empty history; and
-        // `History::save` refuses a path without a file name, so even an
-        // accidental save could not write anywhere.
-        let mut history = History::load(Path::new(""));
+        // No file behind it: even an accidental save writes nothing.
+        let mut history = History::in_memory();
         if self == Demo::Eight {
             let installed = &eight_slots()[1];
             let gone = [
@@ -249,7 +245,11 @@ mod tests {
     }
 
     #[test]
-    fn demo_history_cannot_be_saved_anywhere() {
-        assert!(Demo::Eight.history().save().is_err());
+    fn demo_history_has_no_file_behind_it() {
+        // A history loaded from a file would fail here or write the file;
+        // an in-memory one does nothing and keeps its records.
+        let history = Demo::Eight.history();
+        history.save().unwrap();
+        assert_eq!(history.records().len(), 3);
     }
 }

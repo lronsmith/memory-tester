@@ -48,6 +48,9 @@ pub enum CaptureWhen {
     Idle,
     /// Partway through a run, which is started automatically.
     Running,
+    /// A run, started automatically, shown as if 40% of its memory had been
+    /// got ready (real allocation is too quick to catch in a demo).
+    Allocating,
     /// After a run, started automatically, has finished.
     Done,
 }
@@ -120,8 +123,13 @@ pub fn parse(args: &[String]) -> Result<Options, CliError> {
                 let when = match value {
                     Some("idle") => CaptureWhen::Idle,
                     Some("running") => CaptureWhen::Running,
+                    Some("allocating") => CaptureWhen::Allocating,
                     Some("done") => CaptureWhen::Done,
-                    _ => return Err(bad("--screenshot-when must be idle, running or done")),
+                    _ => {
+                        return Err(bad(
+                            "--screenshot-when must be idle, allocating, running or done",
+                        ));
+                    }
                 };
                 if shot_when.replace(when).is_some() {
                     return Err(bad("--screenshot-when given more than once"));
@@ -162,7 +170,7 @@ pub fn usage() -> String {
     if cfg!(feature = "screenshot") {
         text.push_str(
             "--screenshot=<file.png>                  save a picture of the window, then exit\n\
-             --screenshot-when=<idle|running|done>    which moment to capture (default idle)\n",
+             --screenshot-when=<idle|allocating|running|done>  which moment to capture (default idle)\n",
         );
     }
     text
@@ -267,6 +275,7 @@ mod tests {
         };
         assert_eq!(when("idle"), CaptureWhen::Idle);
         assert_eq!(when("running"), CaptureWhen::Running);
+        assert_eq!(when("allocating"), CaptureWhen::Allocating);
         assert_eq!(when("done"), CaptureWhen::Done);
     }
 
@@ -278,7 +287,7 @@ mod tests {
         assert!(parse_bad(&["--screenshot-when=done"]).contains("needs --screenshot"));
         assert!(
             parse_bad(&["--screenshot=a.png", "--screenshot-when=later"])
-                .contains("idle, running or done")
+                .contains("idle, allocating, running or done")
         );
         assert!(
             parse_bad(&["--screenshot=a.png", "--screenshot=b.png"]).contains("more than once")

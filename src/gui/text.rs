@@ -103,13 +103,49 @@ pub fn remembered_note(when_unix: u64) -> String {
     )
 }
 
-/// The caption for a stick whose earlier failure is still on record while
-/// this run gave it a different status.
-pub fn failed_earlier_note(when_unix: u64) -> String {
+/// The caption for a stick that passed this run but is remembered as failed
+/// (and so is still shown as failed).
+pub fn passed_but_failed_note(failed_unix: u64) -> String {
     format!(
-        "Failed earlier, on {}",
-        memory_tester::history::format_date(when_unix)
+        "Passed this time, but failed on {}. A faulty stick can pass a short test.",
+        memory_tester::history::format_date(failed_unix)
     )
+}
+
+/// The caption for a stick that is a suspect in this run and failed on its
+/// own earlier. Only failures of a stick tested alone are remembered.
+pub fn failed_alone_note(failed_unix: u64) -> String {
+    format!(
+        "Failed when tested alone on {}.",
+        memory_tester::history::format_date(failed_unix)
+    )
+}
+
+/// Heading and caption of the list of remembered results for sticks that
+/// are not detected now. When stick detection failed they may well be
+/// installed, so the list does not claim they are gone.
+pub fn past_results_heading(sticks_unknown: bool) -> (&'static str, &'static str) {
+    if sticks_unknown {
+        (
+            "Remembered results",
+            "Sticks this app has tested before. This computer did not say which are in it now.",
+        )
+    } else {
+        (
+            "Previously tested",
+            "Sticks this app remembers that are not in the computer now.",
+        )
+    }
+}
+
+/// The link that clears remembered results. In demo mode nothing is saved,
+/// so it does not speak of saved results.
+pub fn forget_link_text(persists: bool) -> &'static str {
+    if persists {
+        "Forget saved results"
+    } else {
+        "Forget remembered results"
+    }
 }
 
 /// Elapsed time as "MM:SS", or "H:MM:SS" from one hour on.
@@ -160,8 +196,11 @@ fn part(text: impl Into<String>) -> Part {
 /// Separator between the parts of the status line.
 pub const PART_SEPARATOR: &str = " · ";
 
-/// The status line under the progress bar, in pieces, e.g.
-/// "Pass 1 of 4 · Checkerboard · 52 GB under test · 0 errors · 01:23".
+/// The status line under the progress bar, in pieces. A run has two steps,
+/// numbered so that the bar starting again from zero for step 2 does not
+/// look like a restart:
+/// "Step 1 of 2: getting memory ready · 00:12", then
+/// "Step 2 of 2: testing · Pass 1 of 4 · Checkerboard · 52 GB under test · 0 errors · 01:23".
 pub fn status_parts(progress: &Progress) -> Vec<Part> {
     let time = part(format_elapsed(progress.elapsed));
     let errors = Part {
@@ -170,7 +209,7 @@ pub fn status_parts(progress: &Progress) -> Vec<Part> {
     };
     match progress.phase {
         Phase::Allocating => {
-            let mut parts = vec![part("Getting memory ready…")];
+            let mut parts = vec![part("Step 1 of 2: getting memory ready")];
             if progress.error_count > 0 {
                 parts.push(errors);
             }
@@ -182,7 +221,7 @@ pub fn status_parts(progress: &Progress) -> Vec<Part> {
                 Some(total) => format!("Pass {} of {total}", progress.pass),
                 None => format!("Pass {}", progress.pass),
             };
-            let mut parts = vec![part(pass)];
+            let mut parts = vec![part("Step 2 of 2: testing"), part(pass)];
             if !progress.pattern.is_empty() {
                 parts.push(part(progress.pattern));
             }
@@ -198,38 +237,52 @@ pub fn status_parts(progress: &Progress) -> Vec<Part> {
     }
 }
 
-/// What the progress bar shows.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Bar {
-    /// Nothing measurable yet: show an activity indicator instead.
-    Busy,
-    /// A bar filled to `fraction` with `label` on it.
-    Fill {
-        /// 0.0..=1.0.
-        fraction: f32,
-        /// e.g. "52%" or "Pass 3 · 41%".
-        label: String,
-    },
+/// Which step of a run the progress bar is showing; the two are drawn in
+/// different colours.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Step 1: memory is being allocated (and locked).
+    Preparing,
+    /// Step 2: the patterns are running.
+    Testing,
 }
 
-/// The progress bar for a snapshot. Runs with a fixed number of passes show
-/// overall progress; runs that go on until stopped show the current pass's
-/// progress and its number. While memory is being allocated the bar shows
-/// how much has been allocated, once that is known.
+/// What the progress bar shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bar {
+    /// Decides the colour.
+    pub stage: Stage,
+    /// How full, 0.0..=1.0; `None` when nothing is measurable yet, which is
+    /// shown as a moving activity band.
+    pub fraction: Option<f32>,
+    /// The words on the bar, e.g. "52%" or "Getting memory ready… 40%".
+    pub label: String,
+}
+
+/// The progress bar for a snapshot. While memory is being allocated it shows
+/// how much has been obtained, labelled as such, once that is known. Runs
+/// with a fixed number of passes then show overall progress; runs that go on
+/// until stopped show the current pass's progress and its number.
 pub fn progress_bar(progress: &Progress) -> Bar {
-    let fill = |fraction: f32, label: String| Bar::Fill {
-        fraction: fraction.clamp(0.0, 1.0),
+    let testing = |fraction: f32, label: String| Bar {
+        stage: Stage::Testing,
+        fraction: Some(fraction.clamp(0.0, 1.0)),
         label,
     };
     match progress.phase {
-        Phase::Allocating if progress.pass_fraction > 0.0 => fill(
-            progress.pass_fraction,
-            format!("{}%", percent(progress.pass_fraction)),
-        ),
-        Phase::Allocating => Bar::Busy,
+        Phase::Allocating if progress.pass_fraction > 0.0 => Bar {
+            stage: Stage::Preparing,
+            fraction: Some(progress.pass_fraction.clamp(0.0, 1.0)),
+            label: format!("Getting memory ready… {}%", percent(progress.pass_fraction)),
+        },
+        Phase::Allocating => Bar {
+            stage: Stage::Preparing,
+            fraction: None,
+            label: "Getting memory ready…".to_string(),
+        },
         Phase::Testing | Phase::Finished => match progress.overall_fraction {
-            Some(overall) => fill(overall, format!("{}%", percent(overall))),
-            None => fill(
+            Some(overall) => testing(overall, format!("{}%", percent(overall))),
+            None => testing(
                 progress.pass_fraction,
                 format!(
                     "Pass {} · {}%",
@@ -486,9 +539,29 @@ mod tests {
     fn notes_carry_the_date() {
         assert_eq!(remembered_note(1_795_392_000), "Remembered from 2026-11-23");
         assert_eq!(
-            failed_earlier_note(1_795_392_000),
-            "Failed earlier, on 2026-11-23"
+            passed_but_failed_note(1_795_392_000),
+            "Passed this time, but failed on 2026-11-23. A faulty stick can pass a short test."
         );
+        assert_eq!(
+            failed_alone_note(1_795_392_000),
+            "Failed when tested alone on 2026-11-23."
+        );
+    }
+
+    #[test]
+    fn past_results_heading_does_not_claim_undetected_sticks_are_gone() {
+        let (title, caption) = past_results_heading(false);
+        assert_eq!(title, "Previously tested");
+        assert!(caption.contains("not in the computer now"));
+        let (title, caption) = past_results_heading(true);
+        assert_eq!(title, "Remembered results");
+        assert!(!caption.contains("not in the computer"), "{caption}");
+    }
+
+    #[test]
+    fn forget_link_speaks_of_saving_only_when_results_are_saved() {
+        assert_eq!(forget_link_text(true), "Forget saved results");
+        assert_eq!(forget_link_text(false), "Forget remembered results");
     }
 
     #[test]
@@ -530,7 +603,7 @@ mod tests {
         let p = progress(Phase::Testing);
         assert_eq!(
             status_line(&p),
-            "Pass 1 of 4 · Checkerboard · 52 GB under test · 0 errors · 01:23"
+            "Step 2 of 2: testing · Pass 1 of 4 · Checkerboard · 52 GB under test · 0 errors · 01:23"
         );
         assert!(status_parts(&p).iter().all(|part| !part.alert));
 
@@ -540,7 +613,9 @@ mod tests {
             pass: 7,
             ..p
         };
-        assert!(status_line(&endless).starts_with("Pass 7 · Checkerboard · "));
+        assert!(
+            status_line(&endless).starts_with("Step 2 of 2: testing · Pass 7 · Checkerboard · ")
+        );
     }
 
     #[test]
@@ -559,17 +634,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn status_line_while_allocating_and_finishing() {
-        let allocating = Progress {
+    fn allocating(pass_fraction: f32) -> Progress {
+        Progress {
             pass: 0,
             pattern: "",
             tested_bytes: 0,
-            pass_fraction: 0.0,
+            pass_fraction,
             overall_fraction: Some(0.0),
             ..progress(Phase::Allocating)
-        };
-        assert_eq!(status_line(&allocating), "Getting memory ready… · 01:23");
+        }
+    }
+
+    #[test]
+    fn status_line_while_allocating_and_finishing() {
+        let expected = "Step 1 of 2: getting memory ready · 01:23";
+        assert_eq!(status_line(&allocating(0.0)), expected);
+        // Allocation progress goes on the bar, not the status line.
+        assert_eq!(status_line(&allocating(0.6)), expected);
         assert_eq!(
             status_line(&progress(Phase::Finished)),
             "Finishing… · 0 errors · 01:23"
@@ -580,8 +661,9 @@ mod tests {
     fn progress_bar_for_fixed_and_endless_runs() {
         assert_eq!(
             progress_bar(&progress(Phase::Testing)),
-            Bar::Fill {
-                fraction: 0.125,
+            Bar {
+                stage: Stage::Testing,
+                fraction: Some(0.125),
                 label: "12%".to_string()
             }
         );
@@ -594,8 +676,9 @@ mod tests {
         };
         assert_eq!(
             progress_bar(&endless),
-            Bar::Fill {
-                fraction: 0.41,
+            Bar {
+                stage: Stage::Testing,
+                fraction: Some(0.41),
                 label: "Pass 3 · 41%".to_string()
             }
         );
@@ -603,26 +686,39 @@ mod tests {
 
     #[test]
     fn progress_bar_while_allocating() {
-        let mut p = progress(Phase::Allocating);
-        p.pass_fraction = 0.0;
-        assert_eq!(progress_bar(&p), Bar::Busy);
-        p.pass_fraction = 0.4;
         assert_eq!(
-            progress_bar(&p),
-            Bar::Fill {
-                fraction: 0.4,
-                label: "40%".to_string()
+            progress_bar(&allocating(0.0)),
+            Bar {
+                stage: Stage::Preparing,
+                fraction: None,
+                label: "Getting memory ready…".to_string()
+            }
+        );
+        assert_eq!(
+            progress_bar(&allocating(0.4)),
+            Bar {
+                stage: Stage::Preparing,
+                fraction: Some(0.4),
+                label: "Getting memory ready… 40%".to_string()
             }
         );
         // An out-of-range value cannot overfill the bar.
-        p.pass_fraction = 7.0;
-        assert_eq!(
-            progress_bar(&p),
-            Bar::Fill {
-                fraction: 1.0,
-                label: "100%".to_string()
-            }
-        );
+        assert_eq!(progress_bar(&allocating(7.0)).fraction, Some(1.0));
+    }
+
+    #[test]
+    fn allocation_and_testing_bars_never_look_alike() {
+        // A nearly full allocation bar followed by the first moment of
+        // testing: different stage, and a label that says what it measures.
+        let before = progress_bar(&allocating(0.97));
+        let after = progress_bar(&Progress {
+            pass_fraction: 0.0,
+            overall_fraction: Some(0.0),
+            ..progress(Phase::Testing)
+        });
+        assert_ne!(before.stage, after.stage);
+        assert!(before.label.starts_with("Getting memory ready"));
+        assert_eq!(after.label, "0%");
     }
 
     fn summary(tested: u64, locked: u64) -> TestSummary {

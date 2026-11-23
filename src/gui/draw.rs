@@ -18,6 +18,9 @@ pub const INK_SOFT: Color32 = Color32::from_rgb(0x5B, 0x64, 0x70);
 pub const LINE: Color32 = Color32::from_rgb(0xD5, 0xDA, 0xE1);
 /// The Start button.
 pub const ACCENT: Color32 = Color32::from_rgb(0x25, 0x63, 0xEB);
+/// The progress bar while memory is being got ready: a lighter, secondary
+/// blue, so that step reads differently from the test itself.
+pub const ACCENT_SOFT: Color32 = Color32::from_rgb(0x9D, 0xB7, 0xE8);
 /// The DEMO tag; deliberately unlike any status colour.
 pub const DEMO_TAG: Color32 = Color32::from_rgb(0x6D, 0x28, 0xD9);
 

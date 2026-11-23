@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, ColorImage, ViewportCommand};
+use memory_tester::engine::{Phase, Progress};
 
 use super::cli::{CaptureWhen, Screenshot};
 use super::model::{Length, Model, RunState};
@@ -58,11 +59,31 @@ impl Capture {
         }
         if self.request.when != CaptureWhen::Idle && !self.auto_started {
             self.auto_started = true;
-            if self.request.when == CaptureWhen::Running {
+            model.length = match self.request.when {
                 // Several passes, so the run is still going when captured.
-                model.length = Length::Thorough;
-            }
+                CaptureWhen::Running => Length::Thorough,
+                // Never ends by itself; the window closes it.
+                CaptureWhen::Allocating => Length::UntilStopped,
+                _ => model.length,
+            };
             model.start();
+        }
+        if self.request.when == CaptureWhen::Allocating
+            && let RunState::Running(run) = &mut model.run
+        {
+            // Shown in place of the real (instant) allocation of a demo run;
+            // set on every frame, after the model has polled the engine.
+            run.progress = Progress {
+                phase: Phase::Allocating,
+                pass: 0,
+                total_passes: None,
+                pattern: "",
+                pass_fraction: 0.4,
+                overall_fraction: None,
+                tested_bytes: 0,
+                error_count: 0,
+                elapsed: Duration::from_secs(12),
+            };
         }
         if self.requested {
             return;
@@ -71,7 +92,7 @@ impl Capture {
             CaptureWhen::Idle => true,
             CaptureWhen::Running => match &model.run {
                 RunState::Running(run) => {
-                    run.progress.phase == memory_tester::engine::Phase::Testing
+                    run.progress.phase == Phase::Testing
                         && run.progress.overall_fraction.unwrap_or(0.0) >= 0.1
                 }
                 RunState::Finished(_) => {
@@ -81,6 +102,7 @@ impl Capture {
                 RunState::Idle => false,
             },
             CaptureWhen::Done => model.finished().is_some(),
+            CaptureWhen::Allocating => model.is_running(),
         };
         // While running, capture as soon as possible so the run is still going.
         let needed = if self.request.when == CaptureWhen::Running {

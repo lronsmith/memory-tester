@@ -1,6 +1,7 @@
 //! What the window shows and how it changes, kept apart from the drawing so
 //! it can be tested without a window.
 
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use memory_tester::engine::{self, Progress, TestConfig, TestHandle};
@@ -46,10 +47,35 @@ impl Length {
     }
 }
 
+/// The run in progress, reachable from the panic hook (see
+/// [`stop_active_run`]). Only a weak reference: the model owns the run.
+static ACTIVE_RUN: Mutex<Weak<TestHandle>> = Mutex::new(Weak::new());
+
+/// Asks the run in progress, if there is one, to stop. Meant for the panic
+/// hook: it never waits for a lock and never panics.
+pub fn stop_active_run() {
+    if let Ok(active) = ACTIVE_RUN.try_lock()
+        && let Some(handle) = active.upgrade()
+    {
+        handle.stop();
+    }
+}
+
+/// What to do when the person closes the window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Nothing is running: let the window close.
+    Close,
+    /// A run is going: keep the window open while the run stops and gives
+    /// its memory back, then close (see [`Model::ready_to_close`]).
+    WaitForStop,
+}
+
 /// A run in progress.
 #[derive(Debug)]
 pub struct Running {
-    handle: TestHandle,
+    /// Shared only with [`ACTIVE_RUN`], which holds a weak reference.
+    handle: Arc<TestHandle>,
     /// The latest snapshot, refreshed by [`Model::poll`].
     pub progress: Progress,
     /// Stop has been asked for.
@@ -116,6 +142,8 @@ pub struct Model {
     pub confirm_forget: bool,
     /// Set when forgetting could not be saved.
     pub forget_error: Option<String>,
+    /// The window was closed during a run: close it once the run has ended.
+    close_when_stopped: bool,
 }
 
 impl Model {
@@ -139,12 +167,18 @@ impl Model {
             run: RunState::Idle,
             confirm_forget: false,
             forget_error: None,
+            close_when_stopped: false,
         }
     }
 
     /// The demo being shown, if any.
     pub fn demo_kind(&self) -> Option<Demo> {
         self.demo
+    }
+
+    /// True when results are saved to the history file (false in demo mode).
+    pub fn persists(&self) -> bool {
+        self.persist
     }
 
     /// True while a run is going.
@@ -174,7 +208,8 @@ impl Model {
         if self.is_running() {
             return;
         }
-        let handle = engine::start(config);
+        let handle = Arc::new(engine::start(config));
+        *ACTIVE_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Arc::downgrade(&handle);
         let progress = handle.progress();
         self.confirm_forget = false;
         self.run = RunState::Running(Box::new(Running {
@@ -203,32 +238,54 @@ impl Model {
         if !run.handle.is_finished() {
             return;
         }
-        if let Some(run) = self.take_run() {
-            let summary = run.handle.join();
+        if let Some(handle) = self.take_run() {
+            let summary = handle.join();
             self.finish(summary, unix_now());
         }
     }
 
     /// Stops any run and waits for it to give its memory back. For shutdown.
     pub fn stop_and_wait(&mut self) {
-        if let Some(run) = self.take_run() {
-            run.handle.stop();
-            let summary = run.handle.join();
+        if let Some(handle) = self.take_run() {
+            handle.stop();
+            let summary = handle.join();
             // The result is still worth keeping (e.g. errors found before
             // the window was closed).
             self.finish(summary, unix_now());
         }
     }
 
-    /// Takes the running run out of the state, leaving any other state as it is.
-    fn take_run(&mut self) -> Option<Box<Running>> {
-        match std::mem::replace(&mut self.run, RunState::Idle) {
-            RunState::Running(run) => Some(run),
+    /// The person closed the window. If a run is going it is told to stop,
+    /// and the window should stay open until [`Model::ready_to_close`].
+    pub fn request_close(&mut self) -> CloseAction {
+        if self.is_running() {
+            self.stop();
+            self.close_when_stopped = true;
+            CloseAction::WaitForStop
+        } else {
+            CloseAction::Close
+        }
+    }
+
+    /// True once a close that had to wait for a run can go ahead.
+    pub fn ready_to_close(&self) -> bool {
+        self.close_when_stopped && !self.is_running()
+    }
+
+    /// Takes the run's handle out of the state, leaving any other state as
+    /// it is, and unregisters it from the panic hook.
+    fn take_run(&mut self) -> Option<TestHandle> {
+        let run = match std::mem::replace(&mut self.run, RunState::Idle) {
+            RunState::Running(run) => run,
             other => {
                 self.run = other;
-                None
+                return None;
             }
-        }
+        };
+        *ACTIVE_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Weak::new();
+        // The model holds the only strong reference; the panic hook only
+        // upgrades its weak one for an instant while the process is failing.
+        Arc::into_inner(run.handle)
     }
 
     /// Turns a finished run into a [`Finished`] state, updating history.
@@ -319,11 +376,15 @@ fn unix_now() -> u64 {
 /// Decides what each slot shows.
 ///
 /// - An empty slot shows `Empty`.
-/// - While a run is going, every installed stick shows `Testing`.
-/// - A conclusive result from this session (`session`, one per slot) beats a
-///   remembered one. If that stick's remembered result is a failure and this
-///   session says otherwise, a note keeps the failure in view, because the
-///   history keeps it until the person clears it.
+/// - While a run is going, every installed stick shows `Testing`, keeping its
+///   "Remembered from" note so the layout does not jump.
+/// - A remembered `Failed` beats a `Passed` from this session: the stick stays
+///   `Failed`, with a note that it passed this time. The history keeps a
+///   failure until the person clears it, so this is also what the window
+///   shows after a restart.
+/// - Otherwise a conclusive result from this session (`session`, one per
+///   slot) beats a remembered one. A session `Suspect` for a stick remembered
+///   as failed notes that earlier failure.
 /// - Otherwise the remembered result is shown with its date, if the stick
 ///   can be recognised (see [`rememberable_keys`]).
 /// - Otherwise the stick is `Untested`.
@@ -345,24 +406,31 @@ pub fn resolve_slots(
                     note: None,
                 };
             }
+            let remembered = key.as_ref().and_then(|k| history.get(k));
             if running {
                 return SlotShown {
                     shown: Shown::Testing,
-                    note: None,
+                    note: remembered.map(|r| text::remembered_note(r.when_unix)),
                 };
             }
-            let remembered = key.as_ref().and_then(|k| history.get(k));
+            let failed_before = remembered
+                .filter(|r| r.status == StickStatus::Failed)
+                .map(|r| r.when_unix);
             let now = session
                 .and_then(|s| s.get(i).copied())
                 .filter(|&s| s != StickStatus::Untested);
             match (now, remembered) {
-                (Some(status), remembered) => SlotShown {
+                (Some(StickStatus::Passed), _) if failed_before.is_some() => SlotShown {
+                    shown: Shown::Status(StickStatus::Failed),
+                    note: failed_before.map(text::passed_but_failed_note),
+                },
+                (Some(StickStatus::Suspect), _) if failed_before.is_some() => SlotShown {
+                    shown: Shown::Status(StickStatus::Suspect),
+                    note: failed_before.map(text::failed_alone_note),
+                },
+                (Some(status), _) => SlotShown {
                     shown: Shown::Status(status),
-                    note: remembered
-                        .filter(|r| {
-                            r.status == StickStatus::Failed && status != StickStatus::Failed
-                        })
-                        .map(|r| text::failed_earlier_note(r.when_unix)),
+                    note: None,
                 },
                 (None, Some(r)) => SlotShown {
                     shown: Shown::Status(r.status),
@@ -416,12 +484,10 @@ mod tests {
     use super::*;
     use StickStatus::{Failed, Passed, Suspect, Untested};
     use memory_tester::types::{RunEnd, Stick};
-    use std::path::Path;
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
-    /// Engine runs in these tests go one at a time, as only one run per
-    /// process can lock memory on Windows.
+    /// Tests that start runs go one at a time: they share the process-wide
+    /// registration used by [`stop_active_run`].
     static ENGINE: Mutex<()> = Mutex::new(());
 
     const DAY1: u64 = 1_795_392_000; // 2026-11-23
@@ -447,7 +513,7 @@ mod tests {
     }
 
     fn empty_history() -> History {
-        History::load(Path::new(""))
+        History::in_memory()
     }
 
     /// A history remembering `status` for each stick in `slots`.
@@ -501,6 +567,9 @@ mod tests {
         assert_eq!(config.max_bytes, Some(DEMO_MAX_BYTES));
         assert!(config.simulate_fault);
         assert!(!Model::demo(Demo::Pass).test_config().simulate_fault);
+        // Only the real computer's results are written to the history file.
+        assert!(real.persists());
+        assert!(!demo.persists());
     }
 
     #[test]
@@ -555,28 +624,91 @@ mod tests {
     }
 
     #[test]
-    fn earlier_failure_stays_visible_under_a_later_pass() {
+    fn remembered_failure_beats_a_later_pass() {
         let slots = [slot(Some(stick(Some("S"))))];
         let history = remembering(&slots, Failed, DAY0);
         let views = resolve_slots(&slots, Some(&[Passed]), &history, false);
-        assert_eq!(views[0].shown, shown(Passed));
         assert_eq!(
-            views[0].note.as_deref(),
-            Some("Failed earlier, on 2026-11-22")
+            views[0],
+            SlotShown {
+                shown: shown(Failed),
+                note: Some(
+                    "Passed this time, but failed on 2026-11-22. \
+                     A faulty stick can pass a short test."
+                        .to_string()
+                ),
+            }
         );
-        // A session failure needs no reminder of an earlier one.
-        let views = resolve_slots(&slots, Some(&[Failed]), &history, false);
-        assert_eq!(views[0].note, None);
+        // Same colour and word after a restart (no session result).
+        let after_restart = resolve_slots(&slots, None, &history, false);
+        assert_eq!(after_restart[0].shown, views[0].shown);
     }
 
     #[test]
-    fn running_shows_testing_for_installed_sticks() {
-        let slots = [slot(Some(stick(Some("S")))), slot(None)];
+    fn session_failure_or_suspect_beats_anything_remembered() {
+        let slots = [slot(Some(stick(Some("S"))))];
+        let passed = remembering(&slots, Passed, DAY0);
+        for session in [Failed, Suspect] {
+            let views = resolve_slots(&slots, Some(&[session]), &passed, false);
+            assert_eq!(
+                views[0],
+                SlotShown {
+                    shown: shown(session),
+                    note: None
+                }
+            );
+        }
+        let failed = remembering(&slots, Failed, DAY0);
+        let views = resolve_slots(&slots, Some(&[Failed]), &failed, false);
+        assert_eq!(
+            views[0],
+            SlotShown {
+                shown: shown(Failed),
+                note: None
+            }
+        );
+        // Suspect stays amber, with the earlier failure noted.
+        let views = resolve_slots(&slots, Some(&[Suspect]), &failed, false);
+        assert_eq!(views[0].shown, shown(Suspect));
+        assert_eq!(
+            views[0].note.as_deref(),
+            Some("Failed when tested alone on 2026-11-22.")
+        );
+    }
+
+    #[test]
+    fn session_pass_beats_a_remembered_pass() {
+        let slots = [slot(Some(stick(Some("S"))))];
+        let history = remembering(&slots, Passed, DAY0);
+        let views = resolve_slots(&slots, Some(&[Passed]), &history, false);
+        assert_eq!(
+            views[0],
+            SlotShown {
+                shown: shown(Passed),
+                note: None
+            }
+        );
+    }
+
+    #[test]
+    fn running_shows_testing_and_keeps_the_remembered_note() {
+        let slots = [
+            slot(Some(stick(Some("S")))),
+            slot(None),
+            slot(Some(stick(None))),
+        ];
         let history = remembering(&slots, Failed, DAY0);
-        let views = resolve_slots(&slots, Some(&[Passed, Untested]), &history, true);
+        let views = resolve_slots(&slots, Some(&[Passed, Untested, Passed]), &history, true);
         assert_eq!(views[0].shown, Shown::Testing);
-        assert_eq!(views[0].note, None);
+        assert_eq!(views[0].note.as_deref(), Some("Remembered from 2026-11-22"));
         assert_eq!(views[1].shown, Shown::Empty);
+        assert_eq!(
+            views[2],
+            SlotShown {
+                shown: Shown::Testing,
+                note: None
+            }
+        );
     }
 
     #[test]
@@ -609,6 +741,8 @@ mod tests {
     fn whole_memory_block_follows_the_outcome() {
         assert_eq!(overall_status(None), Untested);
         assert_eq!(overall_status(Some(Overall::Pass)), Passed);
+        assert_eq!(overall_status(Some(Overall::FailSingle)), Failed);
+        assert_eq!(overall_status(Some(Overall::FailMultiple)), Suspect);
         assert_eq!(overall_status(Some(Overall::FailUnknownSticks)), Suspect);
         assert_eq!(overall_status(Some(Overall::Inconclusive)), Untested);
         assert_eq!(overall_status(Some(Overall::CouldNotTest)), Untested);
@@ -783,6 +917,69 @@ mod tests {
         assert_eq!(finished.summary.end, RunEnd::Stopped);
         assert_eq!(finished.verdict.overall, Overall::Inconclusive);
         assert!(model.history.records().is_empty());
+    }
+
+    #[test]
+    fn closing_while_idle_closes_at_once() {
+        let mut model = Model::demo(Demo::Pass);
+        assert_eq!(model.request_close(), CloseAction::Close);
+        assert!(!model.ready_to_close(), "nothing was waited for");
+    }
+
+    #[test]
+    fn closing_during_a_run_stops_it_and_waits() {
+        let _one_at_a_time = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut model = Model::demo(Demo::Pass);
+        model.length = Length::UntilStopped;
+        model.start_with(small(&model));
+        assert_eq!(model.request_close(), CloseAction::WaitForStop);
+        let RunState::Running(run) = &model.run else {
+            panic!("still running until polled")
+        };
+        assert!(run.stopping, "the run was told to stop");
+        assert!(!model.ready_to_close(), "must wait for the run");
+        run_to_end(&mut model);
+        assert!(model.ready_to_close());
+    }
+
+    #[test]
+    fn a_second_run_replaces_the_first_result() {
+        let _one_at_a_time = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut model = Model::demo(Demo::SingleFail);
+        model.start_with(small(&model));
+        run_to_end(&mut model);
+        assert_eq!(
+            model.finished().unwrap().verdict.overall,
+            Overall::FailSingle
+        );
+        model.ask_forget();
+        model.forget_error = Some("old".to_string());
+        // The second run has no simulated fault.
+        model.start_with(TestConfig {
+            simulate_fault: false,
+            ..small(&model)
+        });
+        assert!(!model.confirm_forget);
+        run_to_end(&mut model);
+        let finished = model.finished().unwrap();
+        assert_eq!(finished.verdict.overall, Overall::Pass);
+        assert_eq!(finished.summary.error_count, 0);
+        // The stick passed this time but stays failed, as the history does.
+        assert_eq!(model.slot_views()[1].shown, shown(Failed));
+        assert_eq!(model.history.records()[0].status, Failed);
+    }
+
+    #[test]
+    fn the_panic_hook_can_stop_the_active_run() {
+        let _one_at_a_time = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut model = Model::demo(Demo::Pass);
+        model.length = Length::UntilStopped;
+        model.start_with(small(&model));
+        stop_active_run();
+        run_to_end(&mut model);
+        assert_eq!(model.finished().unwrap().summary.end, RunEnd::Stopped);
+        // With no run registered it does nothing.
+        stop_active_run();
     }
 
     #[test]

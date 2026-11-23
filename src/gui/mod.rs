@@ -22,6 +22,8 @@ use memory_tester::history::History;
 use cli::Options;
 use model::Model;
 
+pub use model::stop_active_run;
+
 /// Default and smallest window size, in points.
 const WINDOW_SIZE: [f32; 2] = [760.0, 560.0];
 const MIN_WINDOW_SIZE: [f32; 2] = [520.0, 420.0];

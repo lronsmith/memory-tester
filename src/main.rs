@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use gui::cli::{self, CliError};
 
 fn main() -> ExitCode {
+    install_panic_hook();
     // `args_os` rather than `args`: a non-UTF-8 argument must give a usage
     // message, not a panic.
     let args: Vec<String> = std::env::args_os()
@@ -50,6 +51,34 @@ fn main() -> ExitCode {
     }
 }
 
+/// On a panic in the window's thread: ask a running test to stop, print the
+/// usual panic message, and on a Windows release build (which has no
+/// console) also say what happened in a message box. Panics in the engine's
+/// own threads are left to the engine, which ends the run and reports it.
+fn install_panic_hook() {
+    let print = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let main_thread = std::thread::current().name() == Some("main");
+        if main_thread {
+            gui::stop_active_run();
+        }
+        print(info);
+        #[cfg(all(windows, not(debug_assertions)))]
+        if main_thread {
+            message_box(&crash_message(&info.to_string()), true);
+        }
+    }));
+}
+
+/// The text shown when the program has to close because of an internal error.
+#[cfg(any(all(windows, not(debug_assertions)), test))]
+fn crash_message(detail: &str) -> String {
+    format!(
+        "Memory Tester hit an internal error and has to close. \
+         Any test that was running has been stopped.\n\n{detail}"
+    )
+}
+
 /// Shows a message to the person. It is printed; on Windows it also appears
 /// in a message box, because a release build has no console to print to.
 fn tell(message: &str, is_error: bool) {
@@ -84,5 +113,18 @@ fn message_box(message: &str, is_error: bool) {
             caption.as_ptr(),
             MB_OK | icon,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_message_says_the_test_stopped_and_includes_the_detail() {
+        let text = crash_message("panicked at src/gui/app.rs:1:1: boom");
+        assert!(text.starts_with("Memory Tester hit an internal error"));
+        assert!(text.contains("has been stopped"));
+        assert!(text.ends_with("panicked at src/gui/app.rs:1:1: boom"));
     }
 }
