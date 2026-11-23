@@ -16,12 +16,12 @@ mod patterns;
 use std::hash::BuildHasher;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::types::{RunEnd, TestSummary};
-use alloc::{Arena, Chunk};
+use alloc::{AllocContext, Arena, Chunk};
 use patterns::{Block, ErrorLog, Pattern, verify_block, write_block};
 
 pub use alloc::total_physical_bytes;
@@ -98,6 +98,12 @@ pub struct Progress {
     /// Name of the pattern currently running, e.g. "Checkerboard". Empty while allocating.
     pub pattern: &'static str,
     /// Fraction of the current pass done, 0.0..=1.0.
+    ///
+    /// While the phase is [`Phase::Allocating`] (which can take tens of
+    /// seconds when locking tens of GiB) this instead reports the fraction of
+    /// the memory being aimed for that has been obtained so far. It never goes
+    /// backwards within that phase, but may stop short of 1.0 when the system
+    /// gives less than was aimed for. It starts again from 0.0 for pass 1.
     pub pass_fraction: f32,
     /// Fraction of the whole run done, 0.0..=1.0; `None` when running until stopped.
     pub overall_fraction: Option<f32>,
@@ -119,8 +125,14 @@ pub struct TestHandle {
 }
 
 /// Starts a run on a background thread and returns immediately.
+///
+/// Only one run in the process holds memory at a time. If an earlier run is
+/// still going or still giving its memory back (for example its handle was
+/// just dropped), the new run waits in [`Phase::Allocating`] until that has
+/// finished, so it sees the memory as free and can lock it. [`TestHandle::stop`]
+/// still works while it waits.
 pub fn start(config: TestConfig) -> TestHandle {
-    start_with(config, Hooks::default())
+    start_with(config, RunOptions::default())
 }
 
 impl TestHandle {
@@ -159,12 +171,54 @@ impl Drop for TestHandle {
     }
 }
 
-/// Test-only fault injection; empty in normal builds.
-#[derive(Debug, Default, Clone, Copy)]
-struct Hooks {
+/// Internal settings of a run that are not part of [`TestConfig`]: sizes
+/// that tests shrink, and test-only fault injection.
+#[derive(Debug, Clone, Copy)]
+struct RunOptions {
+    /// Largest allocation chunk.
+    chunk_bytes: usize,
+    /// Largest unit of work handed to a worker, in words.
+    block_words: usize,
     /// Makes a worker thread panic on its first block.
     #[cfg(test)]
     panic_in_worker: bool,
+    /// The system refuses every allocation after this many.
+    #[cfg(test)]
+    refuse_alloc_after: Option<usize>,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        RunOptions {
+            chunk_bytes: alloc::CHUNK_BYTES,
+            block_words: BLOCK_WORDS,
+            #[cfg(test)]
+            panic_in_worker: false,
+            #[cfg(test)]
+            refuse_alloc_after: None,
+        }
+    }
+}
+
+/// Held by the controller thread of the one run that may hold memory; see
+/// [`start`].
+static RUN_SLOT: Mutex<()> = Mutex::new(());
+
+/// Waits for [`RUN_SLOT`], giving up (returning `None`) if a stop is
+/// requested first.
+fn wait_for_run_slot(shared: &Shared) -> Option<MutexGuard<'static, ()>> {
+    loop {
+        match RUN_SLOT.try_lock() {
+            Ok(slot) => return Some(slot),
+            // A run that panicked still released its memory while unwinding.
+            Err(TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(TryLockError::WouldBlock) => {}
+        }
+        if shared.stopping() {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 /// State shared between the handle, the run's controller thread and its
@@ -187,6 +241,10 @@ struct Shared {
     pass_work: AtomicU64,
     /// Bytes processed since testing began. Only ever grows.
     work_done: AtomicU64,
+    /// Bytes the allocation is aiming for (for progress while allocating).
+    alloc_target: AtomicU64,
+    /// Bytes obtained so far by the allocation. Only ever grows.
+    alloc_obtained: AtomicU64,
     tested_bytes: AtomicU64,
     locked_bytes: AtomicU64,
     errors: ErrorLog,
@@ -224,6 +282,8 @@ impl Shared {
             total_passes,
             pass_work: AtomicU64::new(0),
             work_done: AtomicU64::new(0),
+            alloc_target: AtomicU64::new(0),
+            alloc_obtained: AtomicU64::new(0),
             tested_bytes: AtomicU64::new(0),
             locked_bytes: AtomicU64::new(0),
             errors: ErrorLog::default(),
@@ -256,12 +316,21 @@ impl Shared {
         let error_count = self.errors.count();
         let pass_work = self.pass_work.load(Ordering::Acquire);
         if phase == Phase::Allocating || pass_work == 0 {
+            // Read the target first: it only changes while nothing has been
+            // obtained, so the fraction cannot appear to go backwards.
+            let target = self.alloc_target.load(Ordering::Relaxed);
+            let obtained = self.alloc_obtained.load(Ordering::Relaxed);
+            let fraction = if target == 0 {
+                0.0
+            } else {
+                (obtained as f64 / target as f64).min(1.0) as f32
+            };
             return Progress {
                 phase,
                 pass: 0,
                 total_passes: self.total_passes,
                 pattern: "",
-                pass_fraction: 0.0,
+                pass_fraction: fraction,
                 overall_fraction: self.total_passes.map(|_| 0.0),
                 tested_bytes: 0,
                 error_count,
@@ -364,14 +433,23 @@ impl Drop for FinishGuard<'_> {
     }
 }
 
-fn start_with(config: TestConfig, hooks: Hooks) -> TestHandle {
+fn start_with(config: TestConfig, options: RunOptions) -> TestHandle {
     let shared = Arc::new(Shared::new(config.passes.map(|n| n.max(1))));
     let controller_shared = Arc::clone(&shared);
     let spawned = std::thread::Builder::new()
         .name("memory-test".into())
         .spawn(move || {
-            let _finish = FinishGuard(&controller_shared);
-            run(&config, &controller_shared, hooks)
+            let shared = &*controller_shared;
+            // Locals drop in reverse order: the arena inside `run` first, then
+            // `_finish` marks the run finished, and only then is the run slot
+            // released for the next run.
+            let slot = wait_for_run_slot(shared);
+            let _finish = FinishGuard(shared);
+            if slot.is_none() {
+                // Stopped while waiting for an earlier run: nothing tested.
+                return shared.summary(RunEnd::Stopped, 0);
+            }
+            run(&config, shared, options)
         });
     let thread = match spawned {
         Ok(thread) => Some(thread),
@@ -385,13 +463,26 @@ fn start_with(config: TestConfig, hooks: Hooks) -> TestHandle {
 }
 
 /// The body of the controller thread: allocates, tests, frees.
-fn run(config: &TestConfig, shared: &Shared, hooks: Hooks) -> TestSummary {
-    let arena = Arena::allocate(config.max_bytes, &shared.stop);
-    test_arena(&arena, config, shared, hooks)
+fn run(config: &TestConfig, shared: &Shared, options: RunOptions) -> TestSummary {
+    let ctx = AllocContext {
+        chunk_bytes: options.chunk_bytes,
+        stop: &shared.stop,
+        target: &shared.alloc_target,
+        obtained: &shared.alloc_obtained,
+        #[cfg(test)]
+        refuse_after: options.refuse_alloc_after,
+    };
+    let arena = Arena::allocate(config.max_bytes, &ctx);
+    test_arena(&arena, config, shared, options)
     // `arena` is freed here, before the run is marked finished.
 }
 
-fn test_arena(arena: &Arena, config: &TestConfig, shared: &Shared, hooks: Hooks) -> TestSummary {
+fn test_arena(
+    arena: &Arena,
+    config: &TestConfig,
+    shared: &Shared,
+    options: RunOptions,
+) -> TestSummary {
     let tested = arena.total_bytes();
     if shared.stopping() {
         // Stopped while allocating: nothing was tested.
@@ -400,7 +491,7 @@ fn test_arena(arena: &Arena, config: &TestConfig, shared: &Shared, hooks: Hooks)
     if tested == 0 {
         return shared.summary(RunEnd::AllocationFailed, 0);
     }
-    let blocks = split_into_blocks(arena.chunks());
+    let blocks = split_into_blocks(arena.chunks(), options.block_words);
     #[cfg(test)]
     {
         let ranges = arena.chunks().iter().map(|c| {
@@ -436,7 +527,7 @@ fn test_arena(arena: &Arena, config: &TestConfig, shared: &Shared, hooks: Hooks)
             // one worker per sweep, so no two threads touch the same words at
             // once.
             let write = |b: &Block| unsafe { write_block(pattern, b, pass, seed) };
-            if !run_sweep(shared, &blocks, threads, hooks, write) {
+            if !run_sweep(shared, &blocks, threads, &options, write) {
                 break 'passes;
             }
             if config.simulate_fault && pass == 1 && pattern == Pattern::ALL[0] {
@@ -446,7 +537,7 @@ fn test_arena(arena: &Arena, config: &TestConfig, shared: &Shared, hooks: Hooks)
                 // SAFETY: see above.
                 unsafe { verify_block(pattern, b, pass, seed, &shared.errors) };
             };
-            if !run_sweep(shared, &blocks, threads, hooks, verify) {
+            if !run_sweep(shared, &blocks, threads, &options, verify) {
                 break 'passes;
             }
         }
@@ -461,16 +552,18 @@ fn test_arena(arena: &Arena, config: &TestConfig, shared: &Shared, hooks: Hooks)
     shared.summary(end, passes_completed)
 }
 
-/// Cuts the chunks into blocks of at most [`BLOCK_WORDS`] words, numbering
-/// words and blocks across all of test memory.
-fn split_into_blocks(chunks: &[Chunk]) -> Vec<Block> {
+/// Cuts the chunks into blocks of at most `block_words` words (at least 1),
+/// numbering words and blocks across all of test memory. The last block of a
+/// chunk is shorter when the chunk is not a whole number of blocks.
+fn split_into_blocks(chunks: &[Chunk], block_words: usize) -> Vec<Block> {
+    let block_words = block_words.max(1);
     let mut blocks = Vec::new();
     let mut first_word = 0u64;
     for chunk in chunks {
         let words = chunk.bytes() / 8;
         let mut offset = 0;
         while offset < words {
-            let len = (words - offset).min(BLOCK_WORDS);
+            let len = (words - offset).min(block_words);
             blocks.push(Block {
                 ptr: chunk.ptr().wrapping_add(offset),
                 words: len,
@@ -491,7 +584,7 @@ fn run_sweep(
     shared: &Shared,
     blocks: &[Block],
     threads: usize,
-    hooks: Hooks,
+    options: &RunOptions,
     work: impl Fn(&Block) + Sync,
 ) -> bool {
     let next = AtomicUsize::new(0);
@@ -502,7 +595,7 @@ fn run_sweep(
                 break;
             };
             #[cfg(test)]
-            if hooks.panic_in_worker {
+            if options.panic_in_worker {
                 panic!("simulated worker panic");
             }
             work(block);
@@ -513,7 +606,7 @@ fn run_sweep(
         }
     };
     #[cfg(not(test))]
-    let _ = hooks;
+    let _ = options;
 
     let no_panic = std::thread::scope(|scope| {
         // Threads that cannot be created are simply missing; the others,
@@ -573,10 +666,42 @@ mod tests {
         }
     }
 
+    /// Longest any test waits for a run before failing.
+    const PATIENCE: Duration = Duration::from_secs(30);
+
+    /// Polls `handle` until `done` holds and returns that sample. Fails
+    /// (instead of hanging) if the run finishes first or [`PATIENCE`] runs
+    /// out.
+    fn wait_until(handle: &TestHandle, what: &str, done: impl Fn(&Progress) -> bool) -> Progress {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            let p = handle.progress();
+            if done(&p) {
+                return p;
+            }
+            assert_ne!(p.phase, Phase::Finished, "run ended before {what}: {p:?}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {what}: {p:?}"
+            );
+            sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Joins `handle`, failing instead of hanging if it does not finish
+    /// within [`PATIENCE`].
+    fn finish(handle: TestHandle) -> TestSummary {
+        wait_until(&handle, "the end of the run", |p| {
+            p.phase == Phase::Finished
+        });
+        handle.join()
+    }
+
     /// Runs to the end while sampling progress, returning every sample (the
     /// last one taken after the run finished) and the summary.
     fn run_sampling(config: TestConfig) -> (Vec<Progress>, TestSummary) {
         let handle = start(config);
+        let deadline = Instant::now() + PATIENCE;
         let mut samples = Vec::new();
         loop {
             let p = handle.progress();
@@ -584,6 +709,7 @@ mod tests {
             if p.phase == Phase::Finished {
                 break;
             }
+            assert!(Instant::now() < deadline, "run did not finish: {p:?}");
             sleep(Duration::from_millis(1));
         }
         (samples, handle.join())
@@ -712,9 +838,7 @@ mod tests {
         let _serial = alloc::test_alloc_lock();
         let handle = start(small(None));
         // Let it get well into testing first.
-        while handle.progress().phase != Phase::Testing {
-            sleep(Duration::from_millis(1));
-        }
+        wait_until(&handle, "testing", |p| p.phase == Phase::Testing);
         sleep(Duration::from_millis(200));
         let p = handle.progress();
         assert_eq!((p.total_passes, p.overall_fraction), (None, None));
@@ -739,14 +863,31 @@ mod tests {
     fn passes_completed_counts_only_whole_passes_when_stopped() {
         let _serial = alloc::test_alloc_lock();
         let handle = start(small(Some(1000)));
-        while handle.progress().pass < 2 {
-            sleep(Duration::from_millis(1));
-        }
+        let shared = Arc::clone(&handle.shared);
+        wait_until(&handle, "pass 2", |p| p.pass >= 2);
         handle.stop();
-        let summary = handle.join();
+        let summary = finish(handle);
         assert_eq!(summary.end, RunEnd::Stopped);
-        assert!(summary.passes_completed >= 1);
-        assert!(summary.passes_completed < 1000);
+        // The pass that was interrupted is not counted: exactly the passes
+        // whose work was all done are.
+        let pass_work = shared.pass_work.load(Ordering::Relaxed);
+        let whole_passes = shared.work_done.load(Ordering::Relaxed) / pass_work;
+        assert!(whole_passes >= 1);
+        assert_eq!(u64::from(summary.passes_completed), whole_passes);
+    }
+
+    #[test]
+    fn simulated_fault_happens_only_in_the_first_pass() {
+        let _serial = alloc::test_alloc_lock();
+        let summary = finish(start(TestConfig {
+            simulate_fault: true,
+            ..small(Some(3))
+        }));
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert_eq!(summary.passes_completed, 3);
+        assert_eq!(summary.error_count, 1);
+        assert_eq!(summary.errors.len(), 1);
+        assert_eq!(summary.errors[0].pass, 1);
     }
 
     #[test]
@@ -775,10 +916,11 @@ mod tests {
     #[test]
     fn a_worker_panic_ends_the_run_without_hanging_or_leaking() {
         let _serial = alloc::test_alloc_lock();
-        let hooks = Hooks {
+        let options = RunOptions {
             panic_in_worker: true,
+            ..RunOptions::default()
         };
-        let handle = start_with(small(Some(1)), hooks);
+        let handle = start_with(small(Some(1)), options);
         let shared = Arc::clone(&handle.shared);
         let summary = handle.join();
         assert_eq!(summary.end, RunEnd::Stopped);
@@ -794,6 +936,269 @@ mod tests {
         let shared = Arc::clone(&handle.shared);
         assert_eq!(handle.join().end, RunEnd::Completed);
         assert_eq!(shared.bytes_left_allocated(), Some(0));
+    }
+
+    /// Small sizes for the multi-chunk tests: three 64 KiB chunks and a
+    /// 12 KiB one, cut into 24 KiB blocks, so every 64 KiB chunk ends in a
+    /// 16 KiB tail block and the last chunk is a single 12 KiB block.
+    const SMALL_CHUNK: usize = 64 * 1024;
+    const SMALL_BLOCK_WORDS: usize = 24 * 1024 / 8;
+    const UNEVEN_BYTES: u64 = 3 * SMALL_CHUNK as u64 + 12 * 1024;
+
+    fn small_sizes() -> RunOptions {
+        RunOptions {
+            chunk_bytes: SMALL_CHUNK,
+            block_words: SMALL_BLOCK_WORDS,
+            ..RunOptions::default()
+        }
+    }
+
+    /// Allocates [`UNEVEN_BYTES`] in small chunks on the calling thread.
+    fn uneven_arena() -> Arena {
+        let (stop, target, obtained) =
+            (AtomicBool::new(false), AtomicU64::new(0), AtomicU64::new(0));
+        let ctx = AllocContext {
+            chunk_bytes: SMALL_CHUNK,
+            stop: &stop,
+            target: &target,
+            obtained: &obtained,
+            refuse_after: None,
+        };
+        let arena = Arena::allocate(Some(UNEVEN_BYTES), &ctx);
+        let sizes: Vec<usize> = arena.chunks().iter().map(|c| c.bytes()).collect();
+        assert_eq!(sizes, [SMALL_CHUNK, SMALL_CHUNK, SMALL_CHUNK, 12 * 1024]);
+        arena
+    }
+
+    #[test]
+    fn blocks_tile_every_chunk_and_number_words_across_chunks() {
+        let _serial = alloc::test_alloc_lock();
+        let arena = uneven_arena();
+        let blocks = split_into_blocks(arena.chunks(), SMALL_BLOCK_WORDS);
+        let lens: Vec<usize> = blocks.iter().map(|b| b.words).collect();
+        assert_eq!(
+            lens,
+            [3072, 3072, 2048, 3072, 3072, 2048, 3072, 3072, 2048, 1536]
+        );
+        let mut next = blocks.iter();
+        let mut word = 0u64;
+        for chunk in arena.chunks() {
+            // The chunk's blocks start at its first word and follow each
+            // other with no gap or overlap up to its end.
+            let mut at = chunk.ptr();
+            let end = chunk.ptr().wrapping_add(chunk.bytes() / 8);
+            while at < end {
+                let b = next.next().expect("chunk not fully covered");
+                assert_eq!(b.ptr, at);
+                assert_eq!(b.first_word, word);
+                at = at.wrapping_add(b.words);
+                word += b.words as u64;
+            }
+            assert_eq!(at, end);
+        }
+        assert!(next.next().is_none());
+        assert_eq!(word, UNEVEN_BYTES / 8);
+        for (i, b) in blocks.iter().enumerate() {
+            assert_eq!(b.index, i as u64);
+        }
+    }
+
+    /// What the spec says word `global` (at `address`) holds for `pattern`
+    /// in `pass`, for the patterns that do not depend on the seed.
+    fn spec_value(pattern: Pattern, global: u64, address: u64, pass: u32) -> Option<u64> {
+        let walking = 1u64 << ((global + u64::from(pass)) % 64);
+        match pattern {
+            Pattern::AllZeros => Some(0),
+            Pattern::AllOnes => Some(u64::MAX),
+            Pattern::Checkerboard => Some(0xAAAA_AAAA_AAAA_AAAA),
+            Pattern::InverseCheckerboard => Some(0x5555_5555_5555_5555),
+            Pattern::WalkingOnes => Some(walking),
+            Pattern::WalkingZeros => Some(!walking),
+            Pattern::OwnAddress => Some(address),
+            Pattern::Random | Pattern::InverseRandom => None,
+        }
+    }
+
+    #[test]
+    fn every_word_of_uneven_multi_chunk_memory_is_written_and_verified() {
+        let _serial = alloc::test_alloc_lock();
+        let arena = uneven_arena();
+        let chunks = arena.chunks();
+        let blocks = split_into_blocks(chunks, SMALL_BLOCK_WORDS);
+        let options = small_sizes();
+        let seed = 0x5EED_0000_1234_5678;
+        let last_word = |c: &Chunk| c.ptr().wrapping_add(c.bytes() / 8 - 1);
+        // Chunk edges on both sides, the middle of a tail block, and the
+        // first and last word of all test memory.
+        let targets = [
+            chunks[0].ptr(),
+            chunks[0].ptr().wrapping_add(6144 + 1000),
+            last_word(&chunks[0]),
+            chunks[1].ptr(),
+            last_word(&chunks[2]),
+            chunks[3].ptr(),
+            last_word(&chunks[3]),
+        ];
+
+        for pattern in Pattern::ALL {
+            for pass in [1, 2, 64] {
+                let shared = Shared::new(Some(1));
+                // SAFETY: the blocks lie in `arena`, alive for the whole
+                // test, and `run_sweep` gives each block to one worker.
+                let write = |b: &Block| unsafe { write_block(pattern, b, pass, seed) };
+                assert!(run_sweep(&shared, &blocks, 3, &options, write));
+
+                let mut global = 0u64;
+                for c in chunks {
+                    for i in 0..c.bytes() / 8 {
+                        let p = c.ptr().wrapping_add(i);
+                        // SAFETY: `p` is inside a live chunk; no sweep runs.
+                        let got = unsafe { p.read_volatile() };
+                        if let Some(want) = spec_value(pattern, global, p as u64, pass) {
+                            assert_eq!(got, want, "{} pass {pass} word {global}", pattern.name());
+                        }
+                        global += 1;
+                    }
+                }
+
+                let mut planted = Vec::new();
+                for (n, &p) in targets.iter().enumerate() {
+                    // SAFETY: as above.
+                    let written = unsafe { p.read_volatile() };
+                    let bad = written ^ (1u64 << (n * 9 % 64));
+                    // SAFETY: as above.
+                    unsafe { p.write_volatile(bad) };
+                    planted.push(MemError {
+                        address: p as usize,
+                        expected: written,
+                        actual: bad,
+                        pattern: pattern.name(),
+                        pass,
+                    });
+                }
+
+                let verify = |b: &Block| {
+                    // SAFETY: as for `write`.
+                    unsafe { verify_block(pattern, b, pass, seed, &shared.errors) };
+                };
+                assert!(run_sweep(&shared, &blocks, 3, &options, verify));
+                // Chunks need not lie in address order, so compare sorted.
+                let mut found = shared.errors.errors();
+                found.sort_by_key(|e| e.address);
+                planted.sort_by_key(|e| e.address);
+                assert_eq!(found, planted, "{} pass {pass}", pattern.name());
+                assert_eq!(shared.errors.count(), planted.len() as u64);
+            }
+        }
+    }
+
+    #[test]
+    fn uneven_multi_chunk_run_tests_all_its_memory_end_to_end() {
+        let _serial = alloc::test_alloc_lock();
+        let (handle, shared) = {
+            let h = start_with(small(Some(2)), small_sizes());
+            let s = Arc::clone(&h.shared);
+            (h, s)
+        };
+        let summary = finish(handle);
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert_eq!(summary.error_count, 0);
+        assert_eq!(summary.tested_bytes, 16 * MIB);
+        assert_eq!(
+            shared.work_done.load(Ordering::Relaxed),
+            2 * SWEEPS_PER_PASS * 16 * MIB
+        );
+
+        let config = TestConfig {
+            max_bytes: Some(UNEVEN_BYTES),
+            simulate_fault: true,
+            ..small(Some(1))
+        };
+        let summary = finish(start_with(config, small_sizes()));
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert_eq!(summary.tested_bytes, UNEVEN_BYTES);
+        // The fault lands in a tail block (block 5 of 10), and is found.
+        assert_eq!(summary.error_count, 1);
+    }
+
+    #[test]
+    fn an_allocation_refused_part_way_tests_what_was_obtained() {
+        let _serial = alloc::test_alloc_lock();
+        let options = RunOptions {
+            refuse_alloc_after: Some(3),
+            ..small_sizes()
+        };
+        let summary = finish(start_with(small(Some(1)), options));
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert_eq!(summary.tested_bytes, 3 * SMALL_CHUNK as u64);
+        assert_eq!(summary.passes_completed, 1);
+        assert_eq!(summary.error_count, 0);
+
+        let options = RunOptions {
+            refuse_alloc_after: Some(0),
+            ..small_sizes()
+        };
+        let summary = finish(start_with(small(Some(1)), options));
+        assert_eq!(summary.end, RunEnd::AllocationFailed);
+    }
+
+    #[test]
+    fn allocation_progress_is_reported_in_pass_fraction() {
+        let shared = Shared::new(Some(2));
+        let p = shared.progress();
+        assert_eq!(
+            (p.phase, p.pass, p.pass_fraction),
+            (Phase::Allocating, 0, 0.0)
+        );
+        shared.alloc_target.store(400, Ordering::Relaxed);
+        shared.alloc_obtained.store(100, Ordering::Relaxed);
+        let p = shared.progress();
+        assert_eq!((p.phase, p.pass, p.pattern), (Phase::Allocating, 0, ""));
+        assert_eq!(p.pass_fraction, 0.25);
+        assert_eq!(p.overall_fraction, Some(0.0));
+        assert_eq!(p.tested_bytes, 0);
+        shared.alloc_obtained.store(400, Ordering::Relaxed);
+        assert_eq!(shared.progress().pass_fraction, 1.0);
+
+        // A real run feeds the same counters.
+        let _serial = alloc::test_alloc_lock();
+        let handle = start(small(Some(1)));
+        let shared = Arc::clone(&handle.shared);
+        assert_eq!(finish(handle).end, RunEnd::Completed);
+        assert_eq!(shared.alloc_target.load(Ordering::Relaxed), 16 * MIB);
+        assert_eq!(shared.alloc_obtained.load(Ordering::Relaxed), 16 * MIB);
+    }
+
+    #[test]
+    fn runs_wait_for_earlier_runs_and_can_be_stopped_while_waiting() {
+        let _serial = alloc::test_alloc_lock();
+        let first = start(small(None));
+        let first_shared = Arc::clone(&first.shared);
+        wait_until(&first, "testing", |p| p.phase == Phase::Testing);
+
+        // A second run waits without allocating, and stops while waiting.
+        let second = start(small(Some(1)));
+        sleep(Duration::from_millis(100));
+        assert_eq!(second.progress().phase, Phase::Allocating);
+        assert_eq!(second.shared.alloc_target.load(Ordering::Relaxed), 0);
+        second.stop();
+        let summary = finish(second);
+        assert_eq!(summary.end, RunEnd::Stopped);
+        assert_eq!(summary.tested_bytes, 0);
+        assert_eq!(first.progress().phase, Phase::Testing);
+
+        // A third run starts only once the first, dropped without joining,
+        // has released all its memory.
+        let third = start(small(Some(1)));
+        sleep(Duration::from_millis(50));
+        assert_eq!(third.progress().phase, Phase::Allocating);
+        drop(first);
+        wait_until(&third, "allocation", |p| p.phase != Phase::Allocating);
+        assert_eq!(first_shared.phase(), Phase::Finished);
+        assert_eq!(first_shared.bytes_left_allocated(), Some(0));
+        let summary = finish(third);
+        assert_eq!(summary.end, RunEnd::Completed);
+        assert_eq!(summary.tested_bytes, 16 * MIB);
     }
 
     #[cfg(windows)]
