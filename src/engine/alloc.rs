@@ -6,11 +6,11 @@
 //! test; see [`Arena::allocate`].
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Size of one allocation. Small enough that allocating and locking one
-/// chunk takes well under the time a stop request may wait, large enough that
-/// tens of GiB need only a few hundred chunks.
+/// Size of one allocation in normal runs. Small enough that allocating and
+/// locking one chunk takes well under the time a stop request may wait, large
+/// enough that tens of GiB need only a few hundred chunks.
 pub(crate) const CHUNK_BYTES: usize = 128 << 20;
 
 /// Allocation sizes are rounded down to whole pages.
@@ -24,16 +24,66 @@ const DEV_DEFAULT_BYTES: u64 = 256 << 20;
 #[cfg(any(windows, test))]
 const GIB: u64 = 1 << 30;
 
-/// How many bytes to try to test on a machine with `total` bytes of physical
-/// memory, of which `available` are currently free: the available memory
-/// minus a headroom of 1 GiB or 10% of the total, whichever is larger, then
-/// capped at `max_bytes`. The headroom keeps the rest of the system
-/// responsive and stops it paging heavily while the test holds its memory.
+/// What the operating system reports about memory, in bytes.
 #[cfg(any(windows, test))]
-pub(crate) fn target_bytes(total: u64, available: u64, max_bytes: Option<u64>) -> u64 {
-    let headroom = (total / 10).max(GIB);
-    let target = available.saturating_sub(headroom);
-    max_bytes.map_or(target, |cap| target.min(cap))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoryStatus {
+    /// Physical memory installed.
+    pub total_phys: u64,
+    /// Physical memory free right now.
+    pub avail_phys: u64,
+    /// The system commit limit: physical memory plus page files. Every
+    /// committed byte, ours or another program's, counts against it.
+    pub commit_limit: u64,
+    /// Commit still available before the limit is reached.
+    pub avail_commit: u64,
+}
+
+/// How many bytes to aim for.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Targets {
+    /// Bytes to try to lock into RAM.
+    pub locked: u64,
+    /// Bytes to use instead if nothing at all can be locked.
+    pub unlocked: u64,
+}
+
+/// Headroom left free out of a resource of size `total`: 1 GiB or 10% of it,
+/// whichever is larger.
+#[cfg(any(windows, test))]
+fn headroom(total: u64) -> u64 {
+    (total / 10).max(GIB)
+}
+
+/// How much to try to test, given the system's memory `status`.
+///
+/// The locked target is the smaller of available physical memory minus its
+/// headroom and available commit minus its headroom (each headroom being
+/// 1 GiB or 10% of the matching total, whichever is larger), then capped at
+/// `max_bytes`. The physical headroom keeps the rest of the system responsive
+/// and stops it paging heavily. The commit headroom keeps other programs able
+/// to allocate memory: on machines with a small or disabled page file,
+/// committing everything that is physically free would make every other
+/// allocation on the system fail.
+///
+/// The unlocked target is the locked one further capped at half of the
+/// available physical memory, because unlocked memory competes with the rest
+/// of the system for RAM.
+#[cfg(any(windows, test))]
+pub(crate) fn targets(status: &MemoryStatus, max_bytes: Option<u64>) -> Targets {
+    let physical = status
+        .avail_phys
+        .saturating_sub(headroom(status.total_phys));
+    let commit = status
+        .avail_commit
+        .saturating_sub(headroom(status.commit_limit));
+    let locked = physical.min(commit);
+    let locked = max_bytes.map_or(locked, |cap| locked.min(cap));
+    Targets {
+        locked,
+        unlocked: locked.min(status.avail_phys / 2),
+    }
 }
 
 /// Size of the next chunk to allocate when `remaining` bytes are still
@@ -50,7 +100,7 @@ fn next_chunk_len(remaining: u64, chunk_bytes: usize) -> usize {
 pub fn total_physical_bytes() -> Option<u64> {
     #[cfg(windows)]
     {
-        win::memory_status().map(|(total, _)| total)
+        win::memory_status().map(|s| s.total_phys)
     }
     #[cfg(not(windows))]
     {
@@ -132,29 +182,61 @@ trait Pinner {
     fn pin(&mut self, chunk: &Chunk) -> bool;
 }
 
-/// Allocates chunks up to a target, stopping early if `stop` is set.
+/// Settings and shared counters for one allocation.
+#[derive(Debug)]
+pub(crate) struct AllocContext<'a> {
+    /// Largest chunk to allocate ([`CHUNK_BYTES`] in normal runs).
+    pub chunk_bytes: usize,
+    /// Allocation ends early, keeping what it has, when this is set.
+    pub stop: &'a AtomicBool,
+    /// Bytes currently being aimed for, for progress reporting.
+    pub target: &'a AtomicU64,
+    /// Bytes obtained (and kept) so far, for progress reporting. Only grows.
+    pub obtained: &'a AtomicU64,
+    /// Test only: the system refuses every allocation after this many, as
+    /// when the commit limit is reached part way.
+    #[cfg(test)]
+    pub refuse_after: Option<usize>,
+}
+
+/// Allocates chunks up to a target, stopping early if `ctx.stop` is set.
 ///
 /// With a `pinner`, chunks are allocated and pinned one at a time up to
 /// `locked_target` bytes; the first chunk that cannot be allocated or pinned
-/// is freed and growth stops there. If not a single chunk could be pinned, it
-/// falls back to unpinned chunks up to `unlocked_target` bytes, which is also
-/// what happens without a pinner.
+/// is freed and growth stops there, keeping the chunks already pinned. If not
+/// a single chunk could be pinned, it falls back to unpinned chunks up to
+/// `unlocked_target` bytes, which is also what happens without a pinner.
+/// Unpinned growth likewise stops at the first allocation the system refuses.
 fn grow(
-    chunk_bytes: usize,
+    ctx: &AllocContext<'_>,
     locked_target: u64,
     pinner: Option<&mut dyn Pinner>,
     unlocked_target: u64,
-    stop: &AtomicBool,
 ) -> Vec<Chunk> {
+    #[cfg(test)]
+    let granted = std::cell::Cell::new(0usize);
+    let alloc = |len: usize| {
+        #[cfg(test)]
+        {
+            if ctx.refuse_after.is_some_and(|n| granted.get() >= n) {
+                return None;
+            }
+            granted.set(granted.get() + 1);
+        }
+        Chunk::alloc(len)
+    };
+    let stopping = || ctx.stop.load(Ordering::Relaxed);
+
     let mut chunks = Vec::new();
     if let Some(pinner) = pinner {
+        ctx.target.store(locked_target, Ordering::Relaxed);
         let mut total = 0u64;
-        while !stop.load(Ordering::Relaxed) {
-            let len = next_chunk_len(locked_target - total, chunk_bytes);
+        while !stopping() {
+            let len = next_chunk_len(locked_target - total, ctx.chunk_bytes);
             if len == 0 {
                 break;
             }
-            let Some(mut chunk) = Chunk::alloc(len) else {
+            let Some(mut chunk) = alloc(len) else {
                 break;
             };
             if !pinner.pin(&chunk) {
@@ -164,22 +246,27 @@ fn grow(
             chunk.locked = true;
             total += len as u64;
             chunks.push(chunk);
+            ctx.obtained.fetch_add(len as u64, Ordering::Relaxed);
         }
-        if !chunks.is_empty() || stop.load(Ordering::Relaxed) {
+        if !chunks.is_empty() || stopping() {
             return chunks;
         }
     }
+    // Nothing has been obtained yet, so switching the target cannot make the
+    // reported fraction go backwards.
+    ctx.target.store(unlocked_target, Ordering::Relaxed);
     let mut total = 0u64;
-    while !stop.load(Ordering::Relaxed) {
-        let len = next_chunk_len(unlocked_target - total, chunk_bytes);
+    while !stopping() {
+        let len = next_chunk_len(unlocked_target - total, ctx.chunk_bytes);
         if len == 0 {
             break;
         }
-        let Some(chunk) = Chunk::alloc(len) else {
+        let Some(chunk) = alloc(len) else {
             break;
         };
         total += len as u64;
         chunks.push(chunk);
+        ctx.obtained.fetch_add(len as u64, Ordering::Relaxed);
     }
     chunks
 }
@@ -196,36 +283,35 @@ pub(crate) struct Arena {
 }
 
 impl Arena {
-    /// Allocates as much test memory as is safe, at most `max_bytes`. The
-    /// result may be empty when nothing could be allocated or when `stop` was
-    /// set during allocation.
+    /// Allocates as much test memory as is safe, at most `max_bytes`, in
+    /// chunks of at most `ctx.chunk_bytes`. The result may be empty when
+    /// nothing could be allocated or when `ctx.stop` was set during
+    /// allocation.
     ///
-    /// On Windows: reads total and available physical memory, aims for
-    /// [`target_bytes`], and locks each chunk into RAM, raising the process's
-    /// minimum working set a chunk at a time (locking is limited by it). If no
-    /// chunk at all can be locked, it uses unlocked memory instead, at most
-    /// half of the available physical memory.
+    /// On Windows: reads physical and commit figures, aims for [`targets`],
+    /// and locks each chunk into RAM, raising the process's minimum working
+    /// set a chunk at a time (locking is limited by it). If no chunk at all
+    /// can be locked, it uses unlocked memory instead, up to the unlocked
+    /// target.
     ///
     /// Elsewhere (development only): ordinary heap memory, 256 MiB unless
     /// `max_bytes` says otherwise, never locked.
-    pub(crate) fn allocate(max_bytes: Option<u64>, stop: &AtomicBool) -> Arena {
+    pub(crate) fn allocate(max_bytes: Option<u64>, ctx: &AllocContext<'_>) -> Arena {
         #[cfg(windows)]
         {
-            let Some((total, available)) = win::memory_status() else {
+            let Some(status) = win::memory_status() else {
                 return Arena {
                     chunks: Vec::new(),
                     _working_set: None,
                 };
             };
-            let target = target_bytes(total, available, max_bytes);
-            let unlocked_target = target.min(available / 2);
+            let targets = targets(&status, max_bytes);
             let mut working_set = win::WorkingSet::acquire();
             let chunks = grow(
-                CHUNK_BYTES,
-                target,
+                ctx,
+                targets.locked,
                 working_set.as_mut().map(|w| w as &mut dyn Pinner),
-                unlocked_target,
-                stop,
+                targets.unlocked,
             );
             if !chunks.iter().any(|c| c.locked) {
                 // Nothing is locked, so the working set (already put back by
@@ -241,7 +327,7 @@ impl Arena {
         {
             let target = max_bytes.unwrap_or(DEV_DEFAULT_BYTES);
             Arena {
-                chunks: grow(CHUNK_BYTES, 0, None, target, stop),
+                chunks: grow(ctx, 0, None, target),
             }
         }
     }
@@ -311,7 +397,7 @@ mod win {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
-    use super::{Chunk, Pinner};
+    use super::{Chunk, MemoryStatus, Pinner};
 
     /// Extra minimum working set kept on top of the locked bytes, for the
     /// "small overhead" Windows subtracts from the minimum working set when
@@ -323,8 +409,8 @@ mod win {
     /// other's changes.
     static WORKING_SET_IN_USE: AtomicBool = AtomicBool::new(false);
 
-    /// Total and available physical memory in bytes.
-    pub(super) fn memory_status() -> Option<(u64, u64)> {
+    /// Physical memory and commit figures for the whole system.
+    pub(super) fn memory_status() -> Option<MemoryStatus> {
         let mut status = MEMORYSTATUSEX {
             dwLength: size_of::<MEMORYSTATUSEX>() as u32,
             ..Default::default()
@@ -332,7 +418,14 @@ mod win {
         // SAFETY: `status` is a writable MEMORYSTATUSEX with `dwLength` set,
         // as the function requires.
         let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
-        (ok != 0).then_some((status.ullTotalPhys, status.ullAvailPhys))
+        (ok != 0).then_some(MemoryStatus {
+            total_phys: status.ullTotalPhys,
+            avail_phys: status.ullAvailPhys,
+            // Despite the names, these two are the system commit limit and
+            // the commit still available, not page-file sizes.
+            commit_limit: status.ullTotalPageFile,
+            avail_commit: status.ullAvailPageFile,
+        })
     }
 
     /// Reserves and commits `bytes` of fresh read/write memory. Null on
@@ -509,22 +602,115 @@ mod tests {
     /// Small chunks so the tests allocate little memory.
     const SMALL: usize = 64 * 1024;
 
+    /// The counters an `AllocContext` points at.
+    struct Counters {
+        stop: AtomicBool,
+        target: AtomicU64,
+        obtained: AtomicU64,
+    }
+
+    impl Counters {
+        fn new() -> Counters {
+            Counters {
+                stop: AtomicBool::new(false),
+                target: AtomicU64::new(0),
+                obtained: AtomicU64::new(0),
+            }
+        }
+
+        fn ctx(&self, chunk_bytes: usize, refuse_after: Option<usize>) -> AllocContext<'_> {
+            AllocContext {
+                chunk_bytes,
+                stop: &self.stop,
+                target: &self.target,
+                obtained: &self.obtained,
+                refuse_after,
+            }
+        }
+    }
+
+    fn status(
+        total_phys: u64,
+        avail_phys: u64,
+        commit_limit: u64,
+        avail_commit: u64,
+    ) -> MemoryStatus {
+        MemoryStatus {
+            total_phys,
+            avail_phys,
+            commit_limit,
+            avail_commit,
+        }
+    }
+
     #[test]
-    fn target_keeps_the_larger_headroom_and_handles_large_sizes() {
+    fn physical_headroom_is_the_larger_of_1_gib_and_10_percent() {
+        // Commit is plentiful here, so physical memory decides.
+        let plenty = 4096 * GIB;
+        let locked = |total, avail, cap| targets(&status(total, avail, plenty, plenty), cap).locked;
         // 64 GiB machine: 10% (6.4 GiB) beats 1 GiB.
-        let total = 64 * GIB;
-        assert_eq!(target_bytes(total, 60 * GIB, None), 60 * GIB - total / 10);
+        assert_eq!(locked(64 * GIB, 60 * GIB, None), 60 * GIB - 64 * GIB / 10);
         // 8 GiB machine: 1 GiB beats 10% (0.8 GiB).
-        assert_eq!(target_bytes(8 * GIB, 6 * GIB, None), 5 * GIB);
+        assert_eq!(locked(8 * GIB, 6 * GIB, None), 5 * GIB);
         // Less available than headroom: nothing.
-        assert_eq!(target_bytes(8 * GIB, GIB / 2, None), 0);
+        assert_eq!(locked(8 * GIB, GIB / 2, None), 0);
         // The cap applies only when smaller.
-        assert_eq!(target_bytes(8 * GIB, 6 * GIB, Some(64 * MIB)), 64 * MIB);
-        assert_eq!(target_bytes(8 * GIB, 6 * GIB, Some(100 * GIB)), 5 * GIB);
-        // Sizes far above 4 GiB do not wrap.
+        assert_eq!(locked(8 * GIB, 6 * GIB, Some(64 * MIB)), 64 * MIB);
+        assert_eq!(locked(8 * GIB, 6 * GIB, Some(100 * GIB)), 5 * GIB);
+        // Sizes far above 64 GiB do not wrap.
         assert_eq!(
-            target_bytes(1024 * GIB, 1000 * GIB, None),
+            locked(1024 * GIB, 1000 * GIB, None),
             1000 * GIB - 1024 * GIB / 10
+        );
+    }
+
+    #[test]
+    fn commit_bounds_the_target_when_it_is_tighter() {
+        // 64 GiB machine with the page file disabled: the commit limit equals
+        // physical memory, and other programs have committed more than they
+        // keep resident. Physical alone would give 48 - 6.4 = 41.6 GiB.
+        let t = targets(&status(64 * GIB, 48 * GIB, 64 * GIB, 42 * GIB), None);
+        assert_eq!(t.locked, 42 * GIB - 64 * GIB / 10);
+        // Page file disabled and little commit left: nothing to test.
+        let t = targets(&status(16 * GIB, 8 * GIB, 16 * GIB, GIB), None);
+        assert_eq!(
+            t,
+            Targets {
+                locked: 0,
+                unlocked: 0
+            }
+        );
+        // A large system-managed page file: plenty of commit, physical decides.
+        let t = targets(&status(64 * GIB, 48 * GIB, 128 * GIB, 100 * GIB), None);
+        assert_eq!(t.locked, 48 * GIB - 64 * GIB / 10);
+        // Above 64 GiB, with commit tighter and its headroom taken from the
+        // commit limit (10% of 300 GiB), not from physical memory.
+        let t = targets(&status(256 * GIB, 240 * GIB, 300 * GIB, 200 * GIB), None);
+        assert_eq!(t.locked, 200 * GIB - 30 * GIB);
+        // A small commit limit uses the 1 GiB minimum headroom.
+        let t = targets(&status(4 * GIB, 3 * GIB, 5 * GIB, 2 * GIB), None);
+        assert_eq!(t.locked, GIB);
+    }
+
+    #[test]
+    fn unlocked_target_is_bounded_by_commit_and_half_of_free_ram() {
+        // Commit tighter than half the free RAM.
+        let t = targets(&status(64 * GIB, 60 * GIB, 64 * GIB, 20 * GIB), None);
+        assert_eq!(t.unlocked, 20 * GIB - 64 * GIB / 10);
+        // Half the free RAM tighter than commit.
+        let t = targets(&status(64 * GIB, 60 * GIB, 1024 * GIB, 1000 * GIB), None);
+        assert_eq!(t.unlocked, 30 * GIB);
+        // The cap applies to the fallback too.
+        let t = targets(
+            &status(64 * GIB, 60 * GIB, 1024 * GIB, 1000 * GIB),
+            Some(MIB),
+        );
+        assert_eq!(
+            t,
+            Targets {
+                locked: MIB,
+                unlocked: MIB
+            }
         );
     }
 
@@ -557,15 +743,27 @@ mod tests {
         chunks.iter().map(|c| c.bytes()).collect()
     }
 
+    fn always_pins() -> ScriptedPinner {
+        ScriptedPinner {
+            succeed: usize::MAX,
+            asked: 0,
+        }
+    }
+
     #[test]
     fn growth_stops_at_the_first_chunk_that_cannot_be_pinned() {
-        let stop = AtomicBool::new(false);
+        let c = Counters::new();
         let before = live_bytes_on_this_thread();
         let mut pinner = ScriptedPinner {
             succeed: 3,
             asked: 0,
         };
-        let chunks = grow(SMALL, 10 * SMALL as u64, Some(&mut pinner), u64::MAX, &stop);
+        let chunks = grow(
+            &c.ctx(SMALL, None),
+            10 * SMALL as u64,
+            Some(&mut pinner),
+            u64::MAX,
+        );
         assert_eq!(pinner.asked, 4);
         assert_eq!(sizes(&chunks), vec![SMALL; 3]);
         assert!(chunks.iter().all(|c| c.locked));
@@ -577,31 +775,27 @@ mod tests {
 
     #[test]
     fn growth_reaches_an_uneven_target_when_everything_pins() {
-        let stop = AtomicBool::new(false);
-        let mut pinner = ScriptedPinner {
-            succeed: usize::MAX,
-            asked: 0,
-        };
+        let c = Counters::new();
+        let mut pinner = always_pins();
         let target = 2 * SMALL as u64 + SMALL as u64 / 2;
-        let chunks = grow(SMALL, target, Some(&mut pinner), u64::MAX, &stop);
+        let chunks = grow(&c.ctx(SMALL, None), target, Some(&mut pinner), u64::MAX);
         assert_eq!(sizes(&chunks), vec![SMALL, SMALL, SMALL / 2]);
         assert!(chunks.iter().all(|c| c.locked));
     }
 
     #[test]
     fn falls_back_to_unlocked_memory_up_to_its_own_cap() {
-        let stop = AtomicBool::new(false);
+        let c = Counters::new();
         let mut pinner = ScriptedPinner {
             succeed: 0,
             asked: 0,
         };
         let unlocked_target = 2 * SMALL as u64 + 3 * PAGE_BYTES as u64 + 7;
         let chunks = grow(
-            SMALL,
+            &c.ctx(SMALL, None),
             10 * SMALL as u64,
             Some(&mut pinner),
             unlocked_target,
-            &stop,
         );
         assert_eq!(pinner.asked, 1);
         assert_eq!(sizes(&chunks), vec![SMALL, SMALL, 3 * PAGE_BYTES]);
@@ -610,25 +804,89 @@ mod tests {
 
     #[test]
     fn without_a_pinner_memory_is_unlocked() {
-        let stop = AtomicBool::new(false);
-        let chunks = grow(SMALL, 0, None, 3 * SMALL as u64, &stop);
+        let c = Counters::new();
+        let chunks = grow(&c.ctx(SMALL, None), 0, None, 3 * SMALL as u64);
         assert_eq!(sizes(&chunks), vec![SMALL; 3]);
         assert!(chunks.iter().all(|c| !c.locked));
     }
 
     #[test]
-    fn a_stop_request_ends_growth_with_nothing_more_allocated() {
-        let stop = AtomicBool::new(true);
+    fn a_refused_allocation_part_way_keeps_what_was_obtained() {
+        let before = live_bytes_on_this_thread();
+        // Locked growth: the third allocation is refused (commit exhausted).
+        let c = Counters::new();
+        let mut pinner = always_pins();
+        let chunks = grow(
+            &c.ctx(SMALL, Some(2)),
+            10 * SMALL as u64,
+            Some(&mut pinner),
+            u64::MAX,
+        );
+        assert_eq!(sizes(&chunks), vec![SMALL; 2]);
+        assert!(chunks.iter().all(|c| c.locked));
+        assert_eq!(pinner.asked, 2);
+        drop(chunks);
+        // Unlocked growth: same.
+        let c = Counters::new();
+        let chunks = grow(&c.ctx(SMALL, Some(3)), 0, None, 10 * SMALL as u64);
+        assert_eq!(sizes(&chunks), vec![SMALL; 3]);
+        drop(chunks);
+        // Refused from the start, with and without locking: nothing at all.
+        let c = Counters::new();
+        let mut pinner = always_pins();
+        let chunks = grow(
+            &c.ctx(SMALL, Some(0)),
+            10 * SMALL as u64,
+            Some(&mut pinner),
+            u64::MAX,
+        );
+        assert!(chunks.is_empty());
+        assert_eq!(pinner.asked, 0);
+        assert_eq!(live_bytes_on_this_thread(), before);
+    }
+
+    #[test]
+    fn growth_reports_its_target_and_what_it_obtained() {
+        // Locked: the target is the locked target, and only kept chunks count.
+        let c = Counters::new();
         let mut pinner = ScriptedPinner {
-            succeed: usize::MAX,
+            succeed: 2,
             asked: 0,
         };
+        let _chunks = grow(
+            &c.ctx(SMALL, None),
+            5 * SMALL as u64,
+            Some(&mut pinner),
+            u64::MAX,
+        );
+        assert_eq!(c.target.load(Ordering::Relaxed), 5 * SMALL as u64);
+        assert_eq!(c.obtained.load(Ordering::Relaxed), 2 * SMALL as u64);
+        // Fallback: the target switches to the unlocked target.
+        let c = Counters::new();
+        let mut pinner = ScriptedPinner {
+            succeed: 0,
+            asked: 0,
+        };
+        let _chunks = grow(
+            &c.ctx(SMALL, None),
+            5 * SMALL as u64,
+            Some(&mut pinner),
+            3 * SMALL as u64,
+        );
+        assert_eq!(c.target.load(Ordering::Relaxed), 3 * SMALL as u64);
+        assert_eq!(c.obtained.load(Ordering::Relaxed), 3 * SMALL as u64);
+    }
+
+    #[test]
+    fn a_stop_request_ends_growth_with_nothing_more_allocated() {
+        let c = Counters::new();
+        c.stop.store(true, Ordering::Relaxed);
+        let mut pinner = always_pins();
         let chunks = grow(
-            SMALL,
+            &c.ctx(SMALL, None),
             10 * SMALL as u64,
             Some(&mut pinner),
             10 * SMALL as u64,
-            &stop,
         );
         assert!(chunks.is_empty());
         assert_eq!(pinner.asked, 0);
@@ -637,9 +895,9 @@ mod tests {
     #[test]
     fn arena_respects_the_cap_and_memory_is_usable() {
         let _serial = test_alloc_lock();
-        let stop = AtomicBool::new(false);
+        let c = Counters::new();
         let before = live_bytes_on_this_thread();
-        let arena = Arena::allocate(Some(MIB + 100), &stop);
+        let arena = Arena::allocate(Some(MIB + 100), &c.ctx(CHUNK_BYTES, None));
         assert_eq!(arena.total_bytes(), MIB);
         assert_eq!(live_bytes_on_this_thread() - before, MIB);
         for c in arena.chunks() {
@@ -660,8 +918,8 @@ mod tests {
     #[test]
     fn arena_with_a_zero_cap_is_empty() {
         let _serial = test_alloc_lock();
-        let stop = AtomicBool::new(false);
-        let arena = Arena::allocate(Some(0), &stop);
+        let c = Counters::new();
+        let arena = Arena::allocate(Some(0), &c.ctx(CHUNK_BYTES, None));
         assert_eq!(arena.total_bytes(), 0);
         assert!(arena.chunks().is_empty());
     }
@@ -670,9 +928,9 @@ mod tests {
     #[test]
     fn windows_locks_the_memory_and_restores_the_working_set() {
         let _serial = test_alloc_lock();
-        let stop = AtomicBool::new(false);
+        let c = Counters::new();
         let original = win::current_working_set();
-        let arena = Arena::allocate(Some(64 * MIB), &stop);
+        let arena = Arena::allocate(Some(64 * MIB), &c.ctx(CHUNK_BYTES, None));
         assert_eq!(arena.total_bytes(), 64 * MIB);
         assert_eq!(arena.locked_bytes(), 64 * MIB);
         let (raised_min, _) = win::current_working_set();
@@ -689,8 +947,8 @@ mod tests {
     #[test]
     fn dev_default_is_256_mib_unlocked() {
         let _serial = test_alloc_lock();
-        let stop = AtomicBool::new(false);
-        let arena = Arena::allocate(None, &stop);
+        let c = Counters::new();
+        let arena = Arena::allocate(None, &c.ctx(CHUNK_BYTES, None));
         assert_eq!(arena.total_bytes(), 256 * MIB);
         assert_eq!(arena.locked_bytes(), 0);
         assert_eq!(total_physical_bytes(), None);
