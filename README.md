@@ -5,6 +5,12 @@ It shows the memory sticks installed in your PC, tests them while you wait,
 and colours each stick by the result. Faulty RAM is a common cause of random
 crashes, freezes and blue screens, and this program checks for it.
 
+![The Memory Tester window after a test: a green "No errors found" banner above the memory sticks, two drawn green and one red](docs/screenshot.png)
+
+*The window in its built-in demo mode, with made-up sticks and a small
+test; this is not a real PC. It was captured on a development Mac, which is
+why it says the memory could not be locked.*
+
 ## Download
 
 **[Download memory-tester.exe](https://github.com/lronsmith/memory-tester/releases/latest/download/memory-tester.exe)**
@@ -12,6 +18,11 @@ crashes, freezes and blue screens, and this program checks for it.
 There is nothing to install. Save the file anywhere (your Downloads folder is
 fine) and double-click it to run it. It works on Windows 10 and Windows 11
 (64-bit).
+
+The window needs OpenGL graphics. Over Remote Desktop, in some virtual
+machines, or on a PC still using the "Microsoft Basic Display Adapter"
+driver, it may not open; it then shows a message saying it could not open
+its window. Run it on the PC itself, with its graphics driver installed.
 
 ## Download and "Windows protected your PC" warnings
 
@@ -34,12 +45,33 @@ wrong was found in the file.
 
 1. Close your other programs. The test can only check memory that is not in
    use, so the more you close, the more it can test.
-2. Open memory-tester and press **Start**.
-3. Wait for the progress bar to finish. Leave the PC alone while it runs.
+2. Open memory-tester, choose how long to test (see below), and press
+   **Start test**.
+3. Wait for the progress bar to finish. Leave the PC alone while it runs:
+   the test keeps every processor core busy, so other programs will be slow
+   until it is done.
+
+Next to the button you can choose how long the test runs:
+
+- **Thorough (4 passes)**, the default: the memory is checked four times
+  over.
+- **Quick (1 pass)**: checked once. This catches obvious faults only.
+- **Until I stop it**: keeps checking until you press **Stop**. If you
+  suspect a fault that comes and goes, leave it running for an hour or more.
+  Every full pass counts: when you stop it after one or more full passes
+  without errors, the sticks are marked as passed.
+
+How long a pass takes depends on how much memory the PC has and how fast it
+is. As a rough guide only, estimated rather than measured on a real PC: a
+PC with 64 GB might take 5 to 15 seconds to get the memory ready, then
+roughly 30 to 45 seconds per pass. That is about a minute for Quick and
+about three minutes for Thorough. A PC with less memory is quicker. The
+progress bar shows how far it has got.
 
 Each memory stick on screen is coloured:
 
-- **Grey**: not tested yet.
+- **Grey**: no result. Not tested yet, or the test was stopped before it
+  finished one full pass, or it could not run.
 - **Green**: passed. No fault was found.
 - **Red**: this stick failed while it was the only stick installed. See the
   next section for what that means.
@@ -57,12 +89,15 @@ that one of them is faulty, not which one. To find it, test the sticks one at
 a time:
 
 1. Shut down the PC and unplug it from the wall.
-2. Remove all memory sticks except one.
-3. Start the PC, run memory-tester, and press Start.
-4. Repeat for each stick in turn, putting each one in the same slot.
+2. Remove all memory sticks except one. Put it in the slot your motherboard
+   manual recommends for a single stick (often the one labelled A2); many
+   PCs will not start with one stick in the wrong slot.
+3. Start the PC, run memory-tester, and press **Start test**.
+4. Repeat for each stick in turn, putting each one in that same slot.
 
 The program remembers each stick by its serial number, so after testing them
-one by one it shows the result for all of them.
+one by one it shows the result for all of them. A remembered result is
+labelled "Remembered by serial number".
 
 - If one stick is red and the others pass when tested alone in the same
   slot, the red stick is faulty and should be replaced.
@@ -72,19 +107,27 @@ one by one it shows the result for all of them.
 **Tip:** if every stick fails, but only when the memory speed profile in the
 motherboard settings (called XMP, DOCP or EXPO) is turned on, the sticks may
 well be fine. The profile may simply be too fast for your system. Try turning
-it off, or choosing a slower speed, and test again.
+it off, or choosing a slower speed, then press **Forget saved results**
+before testing again. Otherwise the sticks stay red from the earlier
+failures, even if they now pass.
 
 Some sticks cannot be remembered: those with no serial number, and those that
-share a serial number with another installed stick. Write down the result
-for those sticks yourself after each test.
+share a serial number with another stick, even when they are later tested
+one at a time. The program notices a shared serial number when the sticks
+are installed together, which is why you start with all of them in. Write
+down the result for those sticks yourself after each test; the window
+reminds you when this applies.
 
 ## Limits
 
 To be clear about what it cannot do:
 
-- It cannot test the part of the memory that Windows itself is using while
-  the program runs.
-- A pass makes a memory fault unlikely, not impossible.
+- It cannot test the part of the memory that Windows and other programs are
+  using while it runs. It also leaves some memory free on purpose (at least
+  1 GB, or a tenth of the memory if that is more) so the PC stays
+  responsive.
+- A pass does not prove the memory is healthy. A quick test catches obvious
+  faults; a fault that comes and goes may only show after a long run.
 - A tester that starts the PC from a USB stick before Windows loads, such as
   [MemTest86](https://www.memtest86.com/), can test all of the memory and is
   more thorough. Use one of those if you want to be certain.
@@ -102,7 +145,7 @@ processor cores at once.
 
 It needs no administrator rights, uses no driver and does not use the
 network. Nothing is installed: the only file it writes is a small results
-file in `%LOCALAPPDATA%\memory-tester`.
+file, normally in `%LOCALAPPDATA%\memory-tester`.
 
 ## For developers
 
