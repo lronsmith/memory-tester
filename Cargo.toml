@@ -9,7 +9,7 @@ repository = "https://github.com/lronsmith/memory-tester"
 [dependencies]
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
 [profile.release]
 opt-level = 3
